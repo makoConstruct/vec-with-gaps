@@ -4,6 +4,7 @@ use std::{
     alloc::{Allocator, Global, Layout},
     cmp::max,
     iter::{Iterator, Peekable},
+    marker::PhantomData,
     mem::{align_of, size_of},
     ptr,
     ptr::NonNull,
@@ -11,12 +12,12 @@ use std::{
     vec::Vec,
 };
 
-
 pub struct VWGIter<'a, V> {
     mem: *mut V,
     sections: Peekable<slice::Iter<'a, VWGSection>>,
     si: usize,
 }
+
 impl<'a, V: 'a> Iterator for VWGIter<'a, V> {
     type Item = &'a V;
     fn next(&mut self) -> Option<&'a V> {
@@ -35,6 +36,84 @@ impl<'a, V: 'a> Iterator for VWGIter<'a, V> {
             *si = 0;
         }
         None
+    }
+}
+
+pub struct VWGUglyPtrIter<'a, V> {
+    sections_start: *const VWGSection,
+    sections_end: *const VWGSection,
+    within_section_start: *const V,
+    within_section_end: *const V,
+    mem: *const V,
+    _phanto: PhantomData<&'a V>,
+}
+impl<'a, V: 'a> Iterator for VWGUglyPtrIter<'a, V> {
+    type Item = &'a V;
+    fn next(&mut self) -> Option<&'a V> {
+        let Self {
+            mem,
+            ref mut sections_start,
+            sections_end,
+            ref mut within_section_start,
+            ref mut within_section_end,
+            ..
+        } = *self;
+        unsafe {
+            loop {
+                if within_section_start != within_section_end {
+                    let ret = Some(&**within_section_start);
+                    *within_section_start = within_section_start.wrapping_add(1);
+                    return ret;
+                } else {
+                    loop {
+                        if *sections_start != sections_end {
+                            let VWGSection {
+                                start: ss,
+                                length: sl,
+                            } = **sections_start;
+                            *within_section_start = mem.add(ss);
+                            *within_section_end = mem.wrapping_add(ss + sl);
+                            *sections_start = sections_start.wrapping_add(1);
+                            if *within_section_start != *within_section_end {
+                                break;
+                            }
+                        } else {
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub struct VWGSectionIter<'a, V> {
+    sections_start: *const VWGSection,
+    sections_end: *const VWGSection,
+    mem: *const V,
+    _phanto: PhantomData<&'a V>,
+}
+impl<'a, V: 'a> Iterator for VWGSectionIter<'a, V> {
+    type Item = &'a [V];
+    fn next(&mut self) -> Option<Self::Item> {
+        let Self {
+            mem,
+            ref mut sections_start,
+            sections_end,
+            ..
+        } = *self;
+        if *sections_start != sections_end {
+            unsafe {
+                loop {
+                    let VWGSection { start, length } = **sections_start;
+                    let ret = Some(slice::from_raw_parts(mem.add(start), length));
+                    *sections_start = sections_start.add(1);
+                    return ret;
+                }
+            }
+        } else {
+            return None;
+        }
     }
 }
 
@@ -90,7 +169,9 @@ pub trait VecWithGapsConfig: Clone {
 }
 impl VecWithGapsConfig for DefaultConf {
     // fn initial_spare_space_per_vertex()-> usize { 2 }
-    fn section_growth_multiple(&self) -> f64 { 2f64 }
+    fn section_growth_multiple(&self) -> f64 {
+        2f64
+    }
     fn initial_capacity(&self) -> usize {
         4
     }
@@ -103,22 +184,29 @@ impl VecWithGapsConfig for DefaultConf {
 }
 
 impl<V, A: Allocator + Clone, Conf: VecWithGapsConfig> Clone for VecWithGaps<V, A, Conf> {
-    fn clone(&self)-> Self {
-        
+    fn clone(&self) -> Self {
         let new_mem = if let Some(bs) = self.sections.last() {
-            let nm = self.allocator.allocate(Self::layout(self.total_capacity)).unwrap().cast();
-            unsafe{ ptr::copy_nonoverlapping(
-                self.mem.as_ptr(),
-                nm.cast().as_ptr(),
-                bs.start + bs.length,
-            ); }
+            let nm = self
+                .allocator
+                .allocate(Self::layout(self.total_capacity))
+                .unwrap()
+                .cast();
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    self.mem.as_ptr(),
+                    nm.cast().as_ptr(),
+                    bs.start + bs.length,
+                );
+            }
             nm
-        }else{
-            self.allocator.allocate(Self::layout(self.conf.initial_capacity())).unwrap().cast()
+        } else {
+            self.allocator
+                .allocate(Self::layout(self.conf.initial_capacity()))
+                .unwrap()
+                .cast()
         };
-        
-        
-        Self{
+
+        Self {
             sections: self.sections.clone(),
             total_capacity: self.total_capacity,
             mem: new_mem,
@@ -199,21 +287,52 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
         self.increase_capacity_to_fit(self.end_of_used_volume() + gap_width);
         next_section_index
     }
-    fn end_of_used_volume(&self)-> usize {
-        if let Some(s) = self.sections.last() { s.start + s.length } else{ 0 }
+    /// cuts out the gaps to increase adjacency, increasing iteration speed and potentially conserving memory for push-heavy insertions, but if many things are being inserted into earlier sections, the gaps will reemerge and it will be expensive.
+    pub fn trim_gaps(&mut self) {
+        let Self {
+            ref mut sections,
+            mem,
+            ..
+        } = *self;
+        let mut sepi = sections.iter_mut();
+        if let Some(prev_sec) = sepi.next() {
+            let mut last_end = prev_sec.start + prev_sec.length;
+            for cur_sec in sepi {
+                unsafe {
+                    ptr::copy(
+                        mem.as_ptr().add(cur_sec.start),
+                        mem.as_ptr().add(last_end),
+                        cur_sec.length,
+                    );
+                }
+                cur_sec.start = last_end;
+                last_end = cur_sec.start + cur_sec.length;
+            }
+        }
     }
-    fn compute_next_total_capacity_encompassing(&self, encompassing:usize)-> usize {
+    fn end_of_used_volume(&self) -> usize {
+        if let Some(s) = self.sections.last() {
+            s.start + s.length
+        } else {
+            0
+        }
+    }
+    fn compute_next_total_capacity_encompassing(&self, encompassing: usize) -> usize {
         let mut ret = max(self.conf.initial_capacity(), self.total_capacity);
         while ret <= encompassing {
             let (nret, overflowed) = ret.overflowing_mul(2);
-            if overflowed { panic!("tried to grow to a size that overflowed usize"); }
+            if overflowed {
+                panic!("tried to grow to a size that overflowed usize");
+            }
             ret = nret;
         }
         ret
     }
-    fn increase_capacity_to_fit(&mut self, increasing_to:usize){
-        if increasing_to < self.total_capacity { return; }
-        // find the nearest next power growth 
+    fn increase_capacity_to_fit(&mut self, increasing_to: usize) {
+        if increasing_to < self.total_capacity {
+            return;
+        }
+        // find the nearest next power growth
         let new_total_capacity = self.compute_next_total_capacity_encompassing(increasing_to);
         let new_layout = Self::layout(new_total_capacity);
         self.mem = unsafe {
@@ -224,8 +343,8 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
                 new_layout,
             )
         }
-            .unwrap_or_else(|_| std::alloc::handle_alloc_error(new_layout))
-            .cast();
+        .unwrap_or_else(|_| std::alloc::handle_alloc_error(new_layout))
+        .cast();
         self.total_capacity = new_total_capacity;
     }
     pub fn push_section(&mut self) -> usize {
@@ -264,6 +383,20 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
     pub fn section_count(&self) -> usize {
         self.sections.len()
     }
+
+    pub fn section_iter<'a>(&'a self) -> VWGSectionIter<'a, V> {
+        VWGSectionIter {
+            sections_start: self.sections.as_ptr(),
+            sections_end: self.sections.as_ptr().wrapping_add(self.sections.len()),
+            mem: self.mem.as_ptr(),
+            _phanto: Default::default(),
+        }
+    }
+
+    pub fn iter_lego_ugly_hybrid<'a>(&'a self) -> impl Iterator<Item = &'a V> {
+        self.section_iter().flat_map(|s| s.iter())
+    }
+
     fn layout(size: usize) -> Layout {
         // from_size_align_unchecked is fine for these parameters
         unsafe { Layout::from_size_align_unchecked(size * size_of::<V>(), align_of::<V>()) }
@@ -290,7 +423,9 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
 
         if free_space_at_end < section_capacity_increase {
             //attempt to grow
-            let new_total_capacity = self.compute_next_total_capacity_encompassing(total_capacity + section_capacity_increase);
+            let new_total_capacity = self.compute_next_total_capacity_encompassing(
+                total_capacity + section_capacity_increase,
+            );
             //attempt to just enlarge. If it can't be enlarged, allocate a new section of memory, copy the front as well as the back, and use more efficient nonoverlapping copying functions
             let new_layout = Self::layout(new_total_capacity);
             //TODO, when allocators are stabilized, there should be a grow_in_place call. This will allow you to detect when growing fails and copy the data over more efficiently with a pair of copy_unaligneds instead of letting grow copy everything and then copying overlapping the tail sections on top of that.
@@ -322,8 +457,8 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
                     new_layout,
                 )
             }
-                .unwrap_or_else(|_| std::alloc::handle_alloc_error(new_layout))
-                .cast();
+            .unwrap_or_else(|_| std::alloc::handle_alloc_error(new_layout))
+            .cast();
             self.total_capacity = new_total_capacity;
         }
         //later sections
@@ -332,7 +467,8 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
             unsafe {
                 ptr::copy(
                     self.mem.as_ptr().add(next_section_start),
-                    self.mem.as_ptr()
+                    self.mem
+                        .as_ptr()
                         .add(next_section_start + section_capacity_increase),
                     size_of_moving_volume,
                 );
@@ -348,14 +484,14 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
         let at = self.sections[section].length;
         self.insert_into_section(section, at, v);
     }
-    pub fn push(&mut self, v:V) {
+    pub fn push(&mut self, v: V) {
         let si = if self.sections.len() == 0 {
             self.push_section();
             0
-        }else{
+        } else {
             self.sections.len() - 1
         };
-        
+
         self.push_into_section(si, v)
     }
     pub fn insert_into_section(&mut self, section: usize, at: usize, v: V) {
@@ -367,15 +503,16 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
         } = *self;
         let sn = sections.len();
         let mut si = sections.iter().skip(section);
-        let &VWGSection{ start: section_start, length: section_length } = si.next().unwrap_or_else(|| {
+        let &VWGSection {
+            start: section_start,
+            length: section_length,
+        } = si.next().unwrap_or_else(|| {
             panic!(
                 "index out of bounds: there are only {} sections, but the section index is {}",
-                sn,
-                section
+                sn, section
             )
         });
-        let next_section_start_if_next_section_exists: Option<usize> =
-            si.next().map(|s| s.start);
+        let next_section_start_if_next_section_exists: Option<usize> = si.next().map(|s| s.start);
         if at > section_length {
             panic!(
                 "index out of bounds: there are only {} items, but the index was {}",
@@ -415,6 +552,41 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
             si: 0,
         }
     }
+    pub fn iter_lego<'a>(&'a self) -> impl Iterator<Item = &'a V> {
+        let Self {
+            ref sections, mem, ..
+        } = *self;
+        sections.iter().flat_map(move |s| {
+            unsafe { slice::from_raw_parts(mem.as_ptr().add(s.start), s.length) }.iter()
+        })
+    }
+    pub fn ugly_ptr_iter<'a>(&'a self) -> VWGUglyPtrIter<'a, V> {
+        let secp = self.sections.as_ptr();
+        let sl = self.sections.len();
+        if sl != 0 {
+            let &VWGSection {
+                start: tss,
+                length: tsl,
+            } = unsafe { &*secp };
+            VWGUglyPtrIter {
+                mem: self.mem.as_ptr(),
+                sections_start: secp.wrapping_add(1),
+                sections_end: secp.wrapping_add(sl),
+                within_section_start: self.mem.as_ptr().wrapping_add(tss),
+                within_section_end: self.mem.as_ptr().wrapping_add(tss + tsl),
+                _phanto: Default::default(),
+            }
+        }else{
+            VWGUglyPtrIter {
+                mem: self.mem.as_ptr(),
+                sections_start: ptr::null(),
+                sections_end: ptr::null(),
+                within_section_start: ptr::null(),
+                within_section_end: ptr::null(),
+                _phanto: Default::default(),
+            }
+        }
+    }
     pub fn iter_mut<'a>(&'a mut self) -> VWGMutIter<'a, V> {
         VWGMutIter {
             mem: self.mem.as_ptr(),
@@ -447,41 +619,41 @@ impl<V, A: Allocator, C: VecWithGapsConfig> Drop for VecWithGaps<V, A, C> {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     extern crate itertools;
     extern crate rand;
     use super::*;
     use itertools::assert_equal;
-    use rand::{rngs::StdRng, SeedableRng, Rng};
+    use rand::{rngs::StdRng, Rng, SeedableRng};
 
     #[test]
     fn test_create_drop() {
-        let _v:VecWithGaps<usize> = VecWithGaps::new();
+        let _v: VecWithGaps<usize> = VecWithGaps::new();
     }
-    
+
     #[test]
     fn test_push_once() {
-        let mut v:VecWithGaps<usize> = VecWithGaps::new();
+        let mut v: VecWithGaps<usize> = VecWithGaps::new();
         v.push(2);
     }
-    
+
     #[test]
     fn test_many_push() {
-        let testo:&[usize] = &[1,2,3,4,5,6];
-        let mut v:VecWithGaps<usize> = VecWithGaps::new();
-        for u in testo { v.push(*u); }
+        let testo: &[usize] = &[1, 2, 3, 4, 5, 6];
+        let mut v: VecWithGaps<usize> = VecWithGaps::new();
+        for u in testo {
+            v.push(*u);
+        }
         assert_equal(v.iter(), testo.iter());
     }
-    
+
     #[test]
     fn test_segmented_push() {
-        let testo:&[usize] = &[1,2,3, 4,5,6, 7,8,9,];
-        const SEGMENT_LENGTH:usize = 3;
+        let testo: &[usize] = &[1, 2, 3, 4, 5, 6, 7, 8, 9];
+        const SEGMENT_LENGTH: usize = 3;
         let mut segi = 0;
-        let mut v:VecWithGaps<usize> = VecWithGaps::new();
+        let mut v: VecWithGaps<usize> = VecWithGaps::new();
         for neo in testo.iter() {
             v.push(*neo);
             segi += 1;
@@ -492,12 +664,12 @@ mod tests {
         }
         assert_equal(v.iter(), testo.iter());
     }
-    
+
     #[test]
     fn big_attack() {
         let mut rng = StdRng::seed_from_u64(2);
-        let mut v:VecWithGaps<usize> = VecWithGaps::new();
-        const DAYS:usize = 500;
+        let mut v: VecWithGaps<usize> = VecWithGaps::new();
+        const DAYS: usize = 500;
         let mut pushed = 0;
         for _dayi in 0..DAYS {
             // new user comes
