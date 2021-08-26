@@ -3,7 +3,7 @@ name = "vec-with-gaps"
 version = "0.1.0"
 edition = "2018"
 license = "MIT"
-description = "A data structure that behaves like a series of vecs, but where the vecs are kept contiguous in memory, improving cache performance for some workloads"
+description = "A data structure that behaves like a vec of vecs, but where the subvecs are kept contiguous in memory, potentially improving cache performance for some workloads"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

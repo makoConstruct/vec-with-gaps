@@ -1,4 +1,4 @@
-A data structure that behaves like a series of vecs, but where the vecs are kept contiguous in memory, improving cache performance for some workloads.
+A data structure that behaves like a vec of vecs, but where the subvecs are kept contiguous in memory, potentially improving cache performance for some workloads.
 
 Or, at least, it's supposed to improve cache performance for some workloads. Benchmarks indicate that somehow it fails to improve upon a vec of vecs for sequential reads. I don't understand it. I'm not sure where to go from here.
 
