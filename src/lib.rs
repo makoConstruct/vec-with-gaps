@@ -20,6 +20,7 @@ pub struct VWGIter<'a, V> {
 
 impl<'a, V: 'a> Iterator for VWGIter<'a, V> {
     type Item = &'a V;
+    #[inline]
     fn next(&mut self) -> Option<&'a V> {
         let Self {
             mem,
@@ -49,6 +50,7 @@ pub struct VWGUglyPtrIter<'a, V> {
 }
 impl<'a, V: 'a> Iterator for VWGUglyPtrIter<'a, V> {
     type Item = &'a V;
+    #[inline]
     fn next(&mut self) -> Option<&'a V> {
         let Self {
             mem,
@@ -95,6 +97,7 @@ pub struct VWGSectionIter<'a, V> {
 }
 impl<'a, V: 'a> Iterator for VWGSectionIter<'a, V> {
     type Item = &'a [V];
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         let Self {
             mem,
@@ -124,6 +127,7 @@ pub struct VWGMutIter<'a, V> {
 }
 impl<'a, V: 'a> Iterator for VWGMutIter<'a, V> {
     type Item = &'a mut V;
+    #[inline]
     fn next(&mut self) -> Option<&'a mut V> {
         let Self {
             mem,
@@ -184,6 +188,7 @@ impl VecWithGapsConfig for DefaultConf {
 }
 
 impl<V, A: Allocator + Clone, Conf: VecWithGapsConfig> Clone for VecWithGaps<V, A, Conf> {
+    #[inline]
     fn clone(&self) -> Self {
         let new_mem = if let Some(bs) = self.sections.last() {
             let nm = self
@@ -217,6 +222,7 @@ impl<V, A: Allocator + Clone, Conf: VecWithGapsConfig> Clone for VecWithGaps<V, 
 }
 
 impl<V> VecWithGaps<V, Global, DefaultConf> {
+    #[inline]
     pub fn new() -> Self {
         let conf = DefaultConf();
         let allocator = Global::default();
@@ -273,6 +279,7 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
     //   }
     // }
     /// returns the index of the new section
+    #[inline]
     pub fn push_section_after_gap(&mut self, gap_width: usize) -> usize {
         let next_section_index = self.sections.len();
         let start = if let Some(ref bs) = self.sections.last() {
@@ -288,6 +295,7 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
         next_section_index
     }
     /// cuts out the gaps to increase adjacency, increasing iteration speed and potentially conserving memory for push-heavy insertions, but if many things are being inserted into earlier sections, the gaps will reemerge and it will be expensive.
+    #[inline]
     pub fn trim_gaps(&mut self) {
         let Self {
             ref mut sections,
@@ -310,6 +318,7 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
             }
         }
     }
+    #[inline]
     fn end_of_used_volume(&self) -> usize {
         if let Some(s) = self.sections.last() {
             s.start + s.length
@@ -317,6 +326,7 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
             0
         }
     }
+    #[inline]
     fn compute_next_total_capacity_encompassing(&self, encompassing: usize) -> usize {
         let mut ret = max(self.conf.initial_capacity(), self.total_capacity);
         while ret <= encompassing {
@@ -328,6 +338,7 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
         }
         ret
     }
+    #[inline]
     fn increase_capacity_to_fit(&mut self, increasing_to: usize) {
         if increasing_to < self.total_capacity {
             return;
@@ -347,9 +358,11 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
         .cast();
         self.total_capacity = new_total_capacity;
     }
+    #[inline]
     pub fn push_section(&mut self) -> usize {
         self.push_section_after_gap(0)
     }
+    #[inline]
     pub fn get(&self, section: usize, at: usize) -> Option<&V> {
         let Self {
             mem, ref sections, ..
@@ -364,6 +377,7 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
             }
         })
     }
+    #[inline]
     pub fn get_mut(&mut self, section: usize, at: usize) -> Option<&mut V> {
         let Self {
             mem,
@@ -380,10 +394,12 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
             }
         })
     }
+    #[inline]
     pub fn section_count(&self) -> usize {
         self.sections.len()
     }
 
+    #[inline]
     pub fn section_iter<'a>(&'a self) -> VWGSectionIter<'a, V> {
         VWGSectionIter {
             sections_start: self.sections.as_ptr(),
@@ -393,10 +409,13 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
         }
     }
 
+
+    #[inline]
     pub fn iter_lego_ugly_hybrid<'a>(&'a self) -> impl Iterator<Item = &'a V> {
         self.section_iter().flat_map(|s| s.iter())
     }
 
+    #[inline]
     fn layout(size: usize) -> Layout {
         // from_size_align_unchecked is fine for these parameters
         unsafe { Layout::from_size_align_unchecked(size * size_of::<V>(), align_of::<V>()) }
@@ -480,10 +499,12 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
             s.start += section_capacity_increase;
         }
     }
+    #[inline]
     pub fn push_into_section(&mut self, section: usize, v: V) {
         let at = self.sections[section].length;
         self.insert_into_section(section, at, v);
     }
+    #[inline]
     pub fn push(&mut self, v: V) {
         let si = if self.sections.len() == 0 {
             self.push_section();
@@ -494,6 +515,7 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
 
         self.push_into_section(si, v)
     }
+    #[inline]
     pub fn insert_into_section(&mut self, section: usize, at: usize, v: V) {
         //TODO, think about overflows, and think about panics that could break the structure's drop invariants
         let Self {
@@ -545,6 +567,7 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
         }
         self.sections[section].length += 1;
     }
+    #[inline]
     pub fn iter<'a>(&'a self) -> VWGIter<'a, V> {
         VWGIter {
             mem: self.mem.as_ptr(),
@@ -552,6 +575,7 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
             si: 0,
         }
     }
+    #[inline]
     pub fn iter_lego<'a>(&'a self) -> impl Iterator<Item = &'a V> {
         let Self {
             ref sections, mem, ..
@@ -560,6 +584,7 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
             unsafe { slice::from_raw_parts(mem.as_ptr().add(s.start), s.length) }.iter()
         })
     }
+    #[inline]
     pub fn ugly_ptr_iter<'a>(&'a self) -> VWGUglyPtrIter<'a, V> {
         let secp = self.sections.as_ptr();
         let sl = self.sections.len();
@@ -587,6 +612,7 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
             }
         }
     }
+    #[inline]
     pub fn iter_mut<'a>(&'a mut self) -> VWGMutIter<'a, V> {
         VWGMutIter {
             mem: self.mem.as_ptr(),

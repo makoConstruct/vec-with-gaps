@@ -1,8 +1,7 @@
+#![allow(dead_code, incomplete_features)]
 #![feature(test)]
-extern crate rand;
 extern crate test;
 
-use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
 use std::fmt::Debug;
 use test::Bencher;
 use vec_with_gaps::*;
@@ -86,42 +85,45 @@ impl<V: Debug> VWG<V> for VecWithGaps<V> {
     }
 }
 
-fn create_vwg<TV: VWG<V>, V: Clone, RNG: Rng>(rng: &mut RNG, to_push: &V, v: &mut TV) {
-    let mut active_sections: Vec<usize> = Vec::new();
-    let mut less_active_sections: Vec<usize> = Vec::new();
+fn create_vwg<TV: VWG<V>, V: Clone>(to_push: &V, v: &mut TV) {
     const EVENT_COUNT: usize = 52000;
-    for _ in 0..EVENT_COUNT {
-        let eventr: f64 = rng.gen();
-        if eventr < 0.02 {
+    let mut active_sections: Vec<usize> = Vec::with_capacity(EVENT_COUNT / 100 / 2);
+    let mut less_active_sections: Vec<usize> = Vec::with_capacity(EVENT_COUNT / 100 / 2);
+    for n in 0..EVENT_COUNT {
+        let odds = n % 100;
+        if odds < 2 {
             //create a new section
             let si = v.push_section();
             // start it out with something in it
 
-            if rng.gen::<f64>() < 0.8 {
+            if odds < 80 {
                 less_active_sections.push(si);
             } else {
                 active_sections.push(si);
             }
-        } else if eventr < 0.93 {
+        } else if odds < 93 {
             //add to an active one
-            if active_sections.len() != 0 {
-                v.push(*active_sections.choose(rng).unwrap(), to_push.clone());
+            let len = active_sections.len();
+            if len != 0 {
+                let i = n % len;
+                v.push(active_sections[i], to_push.clone());
             }
         } else {
             //add to an old section
-            if less_active_sections.len() != 0 {
-                v.push(*less_active_sections.choose(rng).unwrap(), to_push.clone());
+            let len = less_active_sections.len();
+            if len != 0 {
+                let i = n % len;
+                v.push(less_active_sections[i], to_push.clone());
             }
         }
     }
 }
 
-fn bench_vwg<TV: VWG<[usize; 2]>, RNG: Rng + Clone>(b: &mut Bencher, rng: &mut RNG, vs: &TV) {
+fn bench_vwg<TV: VWG<[usize; 2]>>(b: &mut Bencher, vs: &TV) {
     let to_push = [1, 2];
     b.iter(|| {
-        let mut r = rng.clone();
         let mut ve = vs.clone();
-        create_vwg(&mut r, &to_push, &mut ve);
+        create_vwg(&to_push, &mut ve);
 
         // const READ_COUNT:usize = 30000;
         const READ_COUNT: usize = 200;
@@ -188,30 +190,26 @@ fn bench_vwg_lego_read(b: &mut Bencher, ve: &VecWithGaps<[usize; 2]>) {
 
 // #[bench]
 fn bench_main_vwg_create_and_read(b: &mut Bencher) {
-    let mut r = StdRng::seed_from_u64(780);
-    bench_vwg(b, &mut r, &VecWithGaps::empty());
+    bench_vwg(b, &VecWithGaps::empty());
 }
 
 // #[bench]
 fn bench_dummy_vwg_create_and_read(b: &mut Bencher) {
-    let mut r = StdRng::seed_from_u64(780);
-    bench_vwg(b, &mut r, &DummyVwg::empty());
+    bench_vwg(b, &DummyVwg::empty());
 }
 
 // #[bench]
 fn bench_main_vwg_read(b: &mut Bencher) {
-    let mut r = StdRng::seed_from_u64(780);
     let mut v = VecWithGaps::empty();
-    create_vwg(&mut r, &[5, 8], &mut v);
+    create_vwg(&[5, 8], &mut v);
     bench_vwg_read(b, &v);
 }
 
 #[bench]
 fn bench_main_vwg_create(b: &mut Bencher){
   b.iter(||{
-    let mut r = StdRng::seed_from_u64(780);
     let mut v = VecWithGaps::empty();
-    create_vwg(&mut r, &[5, 8], &mut v);
+    create_vwg(&[5, 8], &mut v);
     v
   });
 }
@@ -219,35 +217,31 @@ fn bench_main_vwg_create(b: &mut Bencher){
 #[bench]
 fn bench_dummy_vwg_create(b: &mut Bencher){
   b.iter(||{
-    let mut r = StdRng::seed_from_u64(780);
     let mut v = DummyVwg::empty();
-    create_vwg(&mut r, &[5, 8], &mut v);
+    create_vwg(&[5, 8], &mut v);
     v
   });
 }
 
 #[bench]
 fn bench_main_vwg_read_ugly(b: &mut Bencher) {
-    let mut r = StdRng::seed_from_u64(780);
     let mut v = VecWithGaps::empty();
-    create_vwg(&mut r, &[5, 8], &mut v);
+    create_vwg(&[5, 8], &mut v);
     bench_vwg_ugly_read(b, &v);
 }
 
 #[bench]
 fn bench_main_vwg_regular_read(b: &mut Bencher) {
-    let mut r = StdRng::seed_from_u64(780);
     let mut v = VecWithGaps::empty();
-    create_vwg(&mut r, &[5, 8], &mut v);
+    create_vwg(&[5, 8], &mut v);
     bench_vwg_regular_read(b, &v);
 }
 
 
 #[bench]
 fn bench_main_vwg_read_ugly_trimmed(b: &mut Bencher) {
-    let mut r = StdRng::seed_from_u64(780);
     let mut v = VecWithGaps::empty();
-    create_vwg(&mut r, &[5, 8], &mut v);
+    create_vwg(&[5, 8], &mut v);
     v.trim_gaps();
     v.print_sizes();
     bench_vwg_ugly_read(b, &v);
@@ -255,9 +249,8 @@ fn bench_main_vwg_read_ugly_trimmed(b: &mut Bencher) {
 
 #[bench]
 fn bench_dummy_vwg_read(b: &mut Bencher) {
-    let mut r = StdRng::seed_from_u64(780);
     let mut v = DummyVwg::empty();
-    create_vwg(&mut r, &[5, 8], &mut v);
+    create_vwg(&[5, 8], &mut v);
     v.print_sizes();
     bench_vwg_read(b, &v);
 }
@@ -265,17 +258,15 @@ fn bench_dummy_vwg_read(b: &mut Bencher) {
 /// uses the lego iterator, an iterator made with fairly standard high level iterator compositions instead of custom pointer twiddling. For some reason, this iterator performs 30% faster.
 #[bench]
 fn bench_main_vwg_read_lego(b: &mut Bencher) {
-    let mut r = StdRng::seed_from_u64(780);
     let mut v = VecWithGaps::empty();
-    create_vwg(&mut r, &[5, 8], &mut v);
+    create_vwg(&[5, 8], &mut v);
     bench_vwg_lego_read(b, &v);
 }
 
 #[bench]
 fn bench_main_vwg_read_lego_trimmed(b: &mut Bencher) {
-    let mut r = StdRng::seed_from_u64(780);
     let mut v = VecWithGaps::empty();
-    create_vwg(&mut r, &[5, 8], &mut v);
+    create_vwg(&[5, 8], &mut v);
     v.trim_gaps();
     bench_vwg_lego_read(b, &v);
 }
