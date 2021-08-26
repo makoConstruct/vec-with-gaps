@@ -160,6 +160,19 @@ fn bench_vwg_ugly_read(b: &mut Bencher, ve: &VecWithGaps<[usize; 2]>) {
     });
 }
 
+fn bench_vwg_regular_read(b: &mut Bencher, ve: &VecWithGaps<[usize; 2]>) {
+    b.iter(|| {
+        let mut total = 0;
+        for _ in 0..READ_REPS {
+            let r = ve
+                .iter()
+                .fold([0, 0], |a, b| [a[0] + b[0] + b[1], a[1] + b[1]]);
+            total += r[0] * r[1];
+        }
+        total
+    });
+}
+
 fn bench_vwg_lego_read(b: &mut Bencher, ve: &VecWithGaps<[usize; 2]>) {
     b.iter(|| {
         let mut total = 0;
@@ -220,6 +233,15 @@ fn bench_main_vwg_read_ugly(b: &mut Bencher) {
     create_vwg(&mut r, &[5, 8], &mut v);
     bench_vwg_ugly_read(b, &v);
 }
+
+#[bench]
+fn bench_main_vwg_regular_read(b: &mut Bencher) {
+    let mut r = StdRng::seed_from_u64(780);
+    let mut v = VecWithGaps::empty();
+    create_vwg(&mut r, &[5, 8], &mut v);
+    bench_vwg_regular_read(b, &v);
+}
+
 
 #[bench]
 fn bench_main_vwg_read_ugly_trimmed(b: &mut Bencher) {
