@@ -103,13 +103,13 @@ fn create_vwg<TV: VWG<V>, V: Clone, RNG: Rng>(rng: &mut RNG, to_push: &V, v: &mu
             }
         } else if eventr < 0.93 {
             //add to an active one
-            if less_active_sections.len() != 0 {
-                v.push(*less_active_sections.choose(rng).unwrap(), to_push.clone());
+            if active_sections.len() != 0 {
+                v.push(*active_sections.choose(rng).unwrap(), to_push.clone());
             }
         } else {
             //add to an old section
-            if active_sections.len() != 0 {
-                v.push(*active_sections.choose(rng).unwrap(), to_push.clone());
+            if less_active_sections.len() != 0 {
+                v.push(*less_active_sections.choose(rng).unwrap(), to_push.clone());
             }
         }
     }
