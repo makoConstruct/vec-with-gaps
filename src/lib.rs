@@ -576,7 +576,7 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
                 within_section_end: self.mem.as_ptr().wrapping_add(tss + tsl),
                 _phanto: Default::default(),
             }
-        }else{
+        } else {
             VWGUglyPtrIter {
                 mem: self.mem.as_ptr(),
                 sections_start: ptr::null(),

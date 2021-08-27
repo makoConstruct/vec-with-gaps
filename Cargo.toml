@@ -10,5 +10,6 @@ description = "A data structure that behaves like a vec of vecs, but where the s
 [dependencies]
 
 [dev-dependencies]
-rand = "0.8.4"
-itertools = "0.10.1"
+rand = { version = "0.8.4", features = ["small_rng"] }
+pcg = "4.1.0"
+itertools = "0.8.2"
