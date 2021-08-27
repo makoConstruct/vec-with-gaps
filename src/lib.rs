@@ -158,11 +158,13 @@ pub struct VecWithGaps<V, A: Allocator = Global, Conf: VecWithGapsConfig = Defau
 pub struct DefaultConf();
 pub trait VecWithGapsConfig: Clone {
     fn initial_capacity(&self) -> usize;
+    /// when loading from iterators, the gap that's inserted between sections
+    fn initial_default_gaps(&self)-> usize;
     /// the proportion by which the total backing vec increases when it is outgrown
     fn increase_total_proportion(&self) -> f64;
     /// the proportion by which a section increases its capacity when outgrown
     fn section_growth_multiple(&self) -> f64;
-    /// the smallest section capacity cleared for a section that is beginning to grow
+    /// after a section has begun to outgrow its bounds, the smallest capacity that will be cleared for it
     fn min_nonzero_section_capacity(&self) -> usize;
     // /// the maximum number of segments it will try to nudge before just extending the whole
     // fn max_nudge_size()-> usize;
@@ -171,6 +173,9 @@ impl VecWithGapsConfig for DefaultConf {
     // fn initial_spare_space_per_vertex()-> usize { 2 }
     fn section_growth_multiple(&self) -> f64 {
         2f64
+    }
+    fn initial_default_gaps(&self)-> usize {
+        2
     }
     fn initial_capacity(&self) -> usize {
         4
@@ -239,6 +244,21 @@ impl<V> VecWithGaps<V, Global, DefaultConf> {
             allocator: allocator,
             conf: conf,
         }
+    }
+    pub fn from_iters<I:Iterator<Item=BI>, BI:Iterator<Item=V>>(mut i:I)-> Self {
+        let mut ret = Self::new();
+        let process_section = |ret: &mut Self, bi:BI|{
+            bi.for_each(move |bin| ret.push(bin));
+        };
+        if let Some(si) = i.next() {
+            ret.push_section();
+            process_section(&mut ret, si);
+            for si in i {
+                ret.push_section_after_gap(ret.conf.initial_default_gaps());
+                process_section(&mut ret, si);
+            }
+        }
+        ret
     }
 }
 
