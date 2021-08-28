@@ -92,7 +92,9 @@ impl<'a, V: 'a> ExactSizeIterator for VWGSectionIter<'a, V> {
     fn len(&self) -> usize {
         unsafe { self.sections_end.offset_from(self.sections_start) as usize }
     }
-    fn is_empty(&self) -> bool { self.sections_end == self.sections_start }
+    fn is_empty(&self) -> bool {
+        self.sections_end == self.sections_start
+    }
 }
 
 pub struct VWGMutIter<'a, V> {
@@ -124,7 +126,7 @@ pub struct VWGSection {
     pub start: usize,
     pub length: usize,
 }
-/// A vec with empty spaces between sections. Useful when you will have lots of short series that you want to be cache coherent, but with gaps between them ready in case something needs to be inserted. Automates the logic of expansion so that each section essentially behaves like a `Vec`.
+/// A data structure that behaves like a vec of vecs, but where the subvecs are kept, in order, in one contiguous section of memory, which improves cache performance for some workloads. Automates the logic of expansion so that each section essentially behaves like a `Vec`.
 pub struct VecWithGaps<V, A: Allocator = Global, Conf: VecWithGapsConfig = DefaultConf> {
     pub sections: Vec<VWGSection>,
     pub total_capacity: usize,
@@ -268,18 +270,18 @@ impl<'a, V: 'a + Clone> VecWithGaps<V, Global, DefaultConf> {
             (actual_content_len as f64 * conf.initial_extra_total_proportion()) as usize,
         );
         let allocator = Global::default();
-        let mem = allocator.allocate(Self::layout(total_capacity)).unwrap();
+        let mem:NonNull<V> = allocator.allocate(Self::layout(total_capacity)).unwrap().cast();
         let mut start = 0;
         let sections = i
             .map(|ss| {
                 let length = ss.len();
                 let ret = VWGSection { start, length };
-                start += length + conf.initial_default_gaps();
                 let mut si = start;
                 for sv in ss {
-                    unsafe { ptr::write(mem.cast::<V>().as_ptr().add(si), sv.clone()) };
+                    unsafe { ptr::write(mem.as_ptr().add(si), sv.clone()) };
                     si += 1;
                 }
+                start += length + conf.initial_default_gaps();
                 ret
             })
             .collect();
@@ -287,7 +289,7 @@ impl<'a, V: 'a + Clone> VecWithGaps<V, Global, DefaultConf> {
             sections,
             total: content_len_total,
             allocator,
-            mem: mem.cast(),
+            mem: mem,
             conf: conf,
             total_capacity,
         }
@@ -615,14 +617,16 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
     pub fn remove_from_section(&mut self, section: usize, at: usize) {
         self.take_from_section(section, at);
     }
-    pub fn remove_section(&mut self, section:usize) {
+    pub fn remove_section(&mut self, section: usize) {
         let sl = self.sections.len();
         let se = self
             .sections
             .get_mut(section)
             .unwrap_or_else(|| section_not_found_panic(sl, section));
         for i in 0..se.length {
-            unsafe{ ptr::drop_in_place(&mut *self.mem.as_ptr().add(i)); }
+            unsafe {
+                ptr::drop_in_place(&mut *self.mem.as_ptr().add(se.start + i));
+            }
         }
         self.sections.remove(section);
     }
@@ -787,5 +791,34 @@ mod tests {
         assert_equal(v.iter(), [1, 2, 3, 4, 5, 7, 8, 10, 11, 12, 13].iter());
         v.remove_section(1);
         assert_equal(v.iter(), [1, 2, 3, 4, 11, 12, 13].iter());
+    }
+
+    #[test]
+    fn drops() {
+        use std::rc::Rc;
+        let o = Rc::new(2usize);
+        {
+            let mut v = {
+                let src = vec![
+                    vec![o.clone(), o.clone(), o.clone()],
+                    vec![o.clone(), o.clone()],
+                    vec![o.clone()],
+                    vec![o.clone()],
+                    vec![o.clone()],
+                ];
+                assert_eq!(Rc::strong_count(&o), 9);
+                VecWithGaps::from_vec_vec(&src)
+            };
+            assert_eq!(Rc::strong_count(&o), 9);
+            v.remove_from_section(1, 0);
+            assert_eq!(Rc::strong_count(&o), 8);
+            v.remove_from_section(4, 0);
+            assert_eq!(Rc::strong_count(&o), 7);
+            v.remove_section(4);
+            assert_eq!(Rc::strong_count(&o), 7);
+            v.remove_section(0);
+            assert_eq!(Rc::strong_count(&o), 4);
+        }
+        assert_eq!(Rc::strong_count(&o), 1);
     }
 }

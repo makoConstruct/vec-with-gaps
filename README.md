@@ -1,6 +1,10 @@
-A data structure that behaves like a vec of vecs, but where the subvecs are kept contiguous in memory, improving cache performance for some workloads.
+<https://crates.io/crates/vec-with-gaps>
 
-Good for situation where the contents of subvecs change only a little bit over time and where they're often read in order. Not good if data changes a lot (unless changes are always concentrated at the very end).
+`VecWithGaps` is a data structure that behaves like a vec of vecs, but where the subvecs are kept, in order, in one contiguous section of memory, which improves cache performance for some workloads.
+
+Mechanically, it is a vec with gaps, sections of uninitialized values interspersed between sections of initialized values, providing free space to add more elements to the subvecs in constant time.
+
+Good for situations where the contents of subvecs change only a little bit over time and where they're often read in order. Not good if data changes a lot (unless changes are always concentrated at the very end).
 
 On mako's computer, sequential read performance benefits start to become substantial at about the point where there are 2_000_000 words. If you are storing only, say, 20_000 words, and unless there's something mulching your cache coherency as you generate the data structure, the cache benefits of using a `VecWithGaps` instead of a `Vec<Vec<V>>` are pretty negligible.
 
