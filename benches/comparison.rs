@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 #![feature(test)]
+extern crate pcg;
 extern crate rand;
 extern crate test;
-extern crate pcg;
 
 use rand::{seq::SliceRandom, Rng, SeedableRng};
 use std::fmt::Debug;
@@ -57,7 +57,7 @@ impl<V: Clone + Debug> VWG<V> for DummyVwg<V> {
 
 impl<V: Debug> VWG<V> for VecWithGaps<V> {
     fn empty() -> Self {
-        Self::new()
+        Self::empty()
     }
     fn push_section(&mut self) -> usize {
         self.push_section_after_gap(0)
@@ -172,20 +172,9 @@ fn bench_vwg_regular_read(b: &mut Bencher, ve: &VecWithGaps<[usize; 2]>) {
     });
 }
 
-fn bench_vwg_lego_read(b: &mut Bencher, ve: &VecWithGaps<[usize; 2]>) {
-    b.iter(|| {
-        let mut total = 0;
-        for _ in 0..READ_REPS {
-            let r = ve
-                .iter_lego()
-                .fold([0, 0], |a, b| [a[0] + b[0] + b[1], a[1] + b[1]]);
-            total += r[0] * r[1];
-        }
-        total
-    });
+fn fast_rng() -> impl Rng + Clone {
+    rand::rngs::StdRng::seed_from_u64(780)
 }
-
-fn fast_rng()-> impl Rng + Clone { rand::rngs::StdRng::seed_from_u64(780) }
 
 // #[bench]
 fn bench_main_vwg_create_and_read(b: &mut Bencher) {
@@ -236,14 +225,6 @@ fn bench_main_vwg_read_ugly(b: &mut Bencher) {
 }
 
 #[bench]
-fn bench_main_vwg_regular_read(b: &mut Bencher) {
-    let mut r = fast_rng();
-    let mut v = VecWithGaps::empty();
-    create_vwg(&mut r, &[5, 8], &mut v);
-    bench_vwg_regular_read(b, &v);
-}
-
-#[bench]
 fn bench_main_vwg_read_ugly_trimmed(b: &mut Bencher) {
     let mut r = fast_rng();
     let mut v = VecWithGaps::empty();
@@ -268,7 +249,7 @@ fn bench_main_vwg_read_lego(b: &mut Bencher) {
     let mut r = fast_rng();
     let mut v = VecWithGaps::empty();
     create_vwg(&mut r, &[5, 8], &mut v);
-    bench_vwg_lego_read(b, &v);
+    bench_vwg_read(b, &v);
 }
 
 #[bench]
@@ -277,5 +258,5 @@ fn bench_main_vwg_read_lego_trimmed(b: &mut Bencher) {
     let mut v = VecWithGaps::empty();
     create_vwg(&mut r, &[5, 8], &mut v);
     v.trim_gaps();
-    bench_vwg_lego_read(b, &v);
+    bench_vwg_read(b, &v);
 }
