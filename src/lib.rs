@@ -415,6 +415,7 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
     pub fn len(&self) -> usize {
         self.sections.len()
     }
+    /// the number of elements in the entire VecWithGaps, every section summed.
     pub fn total(&self) -> usize {
         self.total
     }

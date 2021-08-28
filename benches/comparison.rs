@@ -86,9 +86,10 @@ impl<V: Debug> VWG<V> for VecWithGaps<V> {
 }
 
 fn create_vwg<TV: VWG<V>, V: Clone, RNG: Rng>(rng: &mut RNG, to_push: &V, v: &mut TV) {
+    // (this benchmark is trying to model users actively maintaining small sets of things, some users are active and some are less active)
     let mut active_sections: Vec<usize> = Vec::new();
     let mut less_active_sections: Vec<usize> = Vec::new();
-    const EVENT_COUNT: usize = 100000;
+    const EVENT_COUNT: usize = 1000000;
     for _ in 0..EVENT_COUNT {
         let eventr: f64 = rng.gen();
         if eventr < 0.02 {
@@ -188,15 +189,17 @@ fn bench_dummy_vwg_create_and_read(b: &mut Bencher) {
     bench_vwg(b, &mut r, &DummyVwg::empty());
 }
 
-// #[bench]
+#[bench]
 fn bench_main_vwg_read(b: &mut Bencher) {
     let mut r = fast_rng();
-    let mut v = VecWithGaps::empty();
-    create_vwg(&mut r, &[5, 8], &mut v);
+    //fast create
+    let mut dv = DummyVwg::empty();
+    create_vwg(&mut r, &[5, 8], &mut dv);
+    let v = VecWithGaps::from_vec_vec(&dv.sections);
     bench_vwg_read(b, &v);
 }
 
-#[bench]
+// #[bench]
 fn bench_main_vwg_create(b: &mut Bencher) {
     b.iter(|| {
         let mut r = fast_rng();
@@ -206,7 +209,7 @@ fn bench_main_vwg_create(b: &mut Bencher) {
     });
 }
 
-#[bench]
+// #[bench]
 fn bench_dummy_vwg_create(b: &mut Bencher) {
     b.iter(|| {
         let mut r = fast_rng();
@@ -219,44 +222,27 @@ fn bench_dummy_vwg_create(b: &mut Bencher) {
 #[bench]
 fn bench_main_vwg_read_ugly(b: &mut Bencher) {
     let mut r = fast_rng();
-    let mut v = VecWithGaps::empty();
-    create_vwg(&mut r, &[5, 8], &mut v);
+    //fast create
+    let mut dv = DummyVwg::empty();
+    create_vwg(&mut r, &[5, 8], &mut dv);
+    let v = VecWithGaps::from_vec_vec(&dv.sections);
     bench_vwg_ugly_read(b, &v);
 }
 
-#[bench]
+// #[bench]
 fn bench_main_vwg_read_ugly_trimmed(b: &mut Bencher) {
     let mut r = fast_rng();
     let mut v = VecWithGaps::empty();
     create_vwg(&mut r, &[5, 8], &mut v);
     v.trim_gaps();
-    v.print_sizes();
     bench_vwg_ugly_read(b, &v);
 }
 
 #[bench]
 fn bench_dummy_vwg_read(b: &mut Bencher) {
     let mut r = fast_rng();
+    //fast create
     let mut v = DummyVwg::empty();
     create_vwg(&mut r, &[5, 8], &mut v);
-    v.print_sizes();
-    bench_vwg_read(b, &v);
-}
-
-/// uses the lego iterator, an iterator made with fairly standard high level iterator compositions instead of custom pointer twiddling. For some reason, this iterator performs 30% faster.
-#[bench]
-fn bench_main_vwg_read_lego(b: &mut Bencher) {
-    let mut r = fast_rng();
-    let mut v = VecWithGaps::empty();
-    create_vwg(&mut r, &[5, 8], &mut v);
-    bench_vwg_read(b, &v);
-}
-
-#[bench]
-fn bench_main_vwg_read_lego_trimmed(b: &mut Bencher) {
-    let mut r = fast_rng();
-    let mut v = VecWithGaps::empty();
-    create_vwg(&mut r, &[5, 8], &mut v);
-    v.trim_gaps();
     bench_vwg_read(b, &v);
 }
