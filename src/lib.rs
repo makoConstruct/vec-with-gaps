@@ -1,12 +1,20 @@
-#![feature(generic_associated_types, allocator_api, exact_size_is_empty)]
+#![feature(
+    generic_associated_types,
+    allocator_api,
+    exact_size_is_empty,
+    type_ascription
+)]
 use std::{
     alloc::{Allocator, Global, Layout},
-    cmp::max,
-    iter::{ExactSizeIterator, Iterator, Peekable},
+    cmp::{
+        max, Ordering,
+        Ordering::{Equal, Greater, Less},
+    },
+    iter::{ExactSizeIterator, FromIterator, Iterator},
     marker::PhantomData,
     mem::{align_of, size_of},
     ptr,
-    ptr::NonNull,
+    ptr::{write, NonNull},
     slice,
     vec::Vec,
 };
@@ -97,36 +105,82 @@ impl<'a, V: 'a> ExactSizeIterator for VWGSectionIter<'a, V> {
     }
 }
 
-pub struct VWGMutIter<'a, V> {
-    mem: *mut V,
-    sections: Peekable<slice::Iter<'a, VWGSection>>,
-    si: usize,
-}
-impl<'a, V: 'a> Iterator for VWGMutIter<'a, V> {
-    type Item = &'a mut V;
-    fn next(&mut self) -> Option<&'a mut V> {
-        let Self {
-            mem,
-            ref mut sections,
-            ref mut si,
-        } = *self;
-        while let Some(se) = sections.peek() {
-            if *si < se.length {
-                return Some(unsafe { &mut *(mem.offset((se.start + *si) as isize)) });
+// the following three things are used by batched sorted inserts
+const MERGE_SPARSENESS_LIMIT: usize = 20; // TODO, benchmark to figure out what this should be
+/// assumes that the inputs are sorted. Doesn't actually enact the insertions, reports them to the callbacks
+fn insertions_for_merge<'b, B: 'b, V>(
+    source: &'b [B],
+    dest_slice: &mut [V],
+    comparator: impl Fn(&B, &V) -> Ordering,
+    mut on_collision: impl FnMut(&'b B, &mut V) -> (),
+    mut on_insertion: impl FnMut(&'b B, usize) -> (),
+) {
+    //iterating is faster than binary-searching if the sizing ratios of the arrays are similar, so check for that
+    if source.len() * MERGE_SPARSENESS_LIMIT < dest_slice.len() {
+        for sv in source.iter() {
+            let sr = dest_slice.binary_search_by(|c| comparator(sv, c).reverse());
+            match sr {
+                Ok(s) => on_collision(sv, &mut dest_slice[s]),
+                Err(s) => on_insertion(sv, s),
             }
-            sections.next();
-            *si = 0;
         }
-        None
+    } else {
+        let mut si = source.iter().peekable();
+        for (de, dv) in dest_slice.iter_mut().enumerate() {
+            loop {
+                if let Some(sip) = si.peek() {
+                    match comparator(sip, dv) {
+                        Less => {
+                            on_insertion(sip, de);
+                        }
+                        Equal => {
+                            on_collision(sip, dv);
+                        }
+                        Greater => {
+                            break;
+                        }
+                    }
+                    si.next();
+                } else {
+                    return;
+                }
+            }
+        }
+        //push the rest into the back
+        for sv in si {
+            on_insertion(sv, dest_slice.len());
+        }
     }
 }
+struct Pry {
+    section_start: usize,
+    pry_by: usize,
+}
+#[derive(Copy, Clone)]
+struct InsertHeader{
+    into_section:usize,
+    number_of_elements:usize,
+}
 
-#[derive(Clone)]
+//TODO: an insert instruction that just says "the dst is empty, copy this slice in"
+//TODO: consider trying not storing any insert instructions, and instead going through and doing all of insert calculations again
+// wait did we really need to do the insert computations in advance? If we just assumed there weren't going to be any sets, that they were indeed all inserts, it would be much much faster and simpler, mixing sets and inserts....... is insane
+struct InsertElement<'a, B>{ dst_index:usize, inserting_value: &'a B, }
+impl<'a, B> Clone for InsertElement<'a, B>{ fn clone(&self)-> Self { Self{ dst_index: self.dst_index, inserting_value: self.inserting_value } } }
+impl<'a, B> Copy for InsertElement<'a, B> {}
+
+union Insert<'a, B> {
+    header: InsertHeader,
+    element: InsertElement<'a, B>,
+}
+
+#[derive(Copy, Clone)]
 pub struct VWGSection {
     pub start: usize,
     pub length: usize,
 }
 /// A data structure that behaves like a vec of vecs, but where the subvecs are kept, in order, in one contiguous section of memory, which improves cache performance for some workloads. Automates the logic of expansion so that each section essentially behaves like a `Vec`.
+/// (The members are pub because rust's restrictions on private members are so strict that I do not believe that private members should be used, and because if you're using this, you know how it works and you care enough about performance to want to be able to mess with it.)
 pub struct VecWithGaps<V, A: Allocator = Global, Conf: VecWithGapsConfig = DefaultConf> {
     pub sections: Vec<VWGSection>,
     pub total_capacity: usize,
@@ -135,7 +189,7 @@ pub struct VecWithGaps<V, A: Allocator = Global, Conf: VecWithGapsConfig = Defau
     pub allocator: A,
     pub conf: Conf,
 }
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct DefaultConf();
 pub trait VecWithGapsConfig: Clone {
     fn initial_capacity(&self) -> usize;
@@ -151,6 +205,28 @@ pub trait VecWithGapsConfig: Clone {
     fn min_nonzero_section_capacity(&self) -> usize;
     // /// the maximum number of segments it will try to nudge before just extending the whole
     // fn max_nudge_size()-> usize;
+    fn compute_next_total_capacity_encompassing(&self, encompassing: usize) -> usize {
+        let mut ret = self.initial_capacity();
+        while ret <= encompassing {
+            let mr = ret as f64 * self.increase_total_proportion();
+            if mr > usize::MAX as f64 {
+                panic!("tried to grow total capacity to a size that overflowed usize");
+            }
+            ret = mr as usize;
+        }
+        ret
+    }
+    fn compute_next_section_capacity_encompassing(&self, encompassing: usize) -> usize {
+        let mut ret = self.min_nonzero_section_capacity();
+        while ret <= encompassing {
+            let mr = ret as f64 * self.section_growth_multiple();
+            if mr > usize::MAX as f64 {
+                panic!("tried to grow a section capacity to a size that overflowed usize");
+            }
+            ret = mr as usize;
+        }
+        ret
+    }
 }
 impl VecWithGapsConfig for DefaultConf {
     fn section_growth_multiple(&self) -> f64 {
@@ -170,6 +246,21 @@ impl VecWithGapsConfig for DefaultConf {
     }
     fn increase_total_proportion(&self) -> f64 {
         1.4
+    }
+}
+
+impl<'a, V: Clone, A: Allocator + Clone + Default, Conf: VecWithGapsConfig + Default>
+    FromIterator<&'a [V]> for VecWithGaps<V, A, Conf>
+{
+    fn from_iter<T>(iter: T) -> Self
+    where
+        T: IntoIterator<Item = &'a [V]>,
+    {
+        Self::from_iters_detailed(
+            iter.into_iter().map(|sl| sl.iter()),
+            A::default(),
+            Conf::default(),
+        )
     }
 }
 
@@ -209,8 +300,12 @@ impl<V, A: Allocator + Clone, Conf: VecWithGapsConfig> Clone for VecWithGaps<V, 
 
 impl<V> VecWithGaps<V, Global, DefaultConf> {
     pub fn empty() -> Self {
-        let conf = DefaultConf();
-        let allocator = Global::default();
+        Self::empty_detailed(Global::default(), DefaultConf())
+    }
+}
+
+impl<V, A: Allocator + Clone, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
+    pub fn empty_detailed(allocator: A, conf: Conf) -> Self {
         Self {
             sections: vec![],
             total_capacity: conf.initial_capacity(),
@@ -231,11 +326,16 @@ impl<V> VecWithGaps<V, Global, DefaultConf> {
     }
 }
 
-impl<'a, V: 'a + Clone> VecWithGaps<V, Global, DefaultConf> {
-    pub fn from_iters<I: Iterator<Item = BI> + Clone, BI: Iterator<Item = &'a V>>(
+impl<'a, V: 'a + Clone, A: Allocator + Clone, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
+    pub fn from_slice_slice_detailed(i: &[&[V]], allocator: A, conf: Conf) -> Self {
+        Self::from_iters_detailed(i.iter().map(|ii| ii.iter()), allocator, conf)
+    }
+    pub fn from_iters_detailed<I: Iterator<Item = BI>, BI: Iterator<Item = &'a V>>(
         mut i: I,
+        allocator: A,
+        conf: Conf,
     ) -> Self {
-        let mut ret = Self::empty();
+        let mut ret = Self::empty_detailed(allocator, conf);
         let process_section = |ret: &mut Self, bi: BI| {
             bi.for_each(move |bin| ret.push(bin.clone()));
         };
@@ -249,28 +349,31 @@ impl<'a, V: 'a + Clone> VecWithGaps<V, Global, DefaultConf> {
         }
         ret
     }
-    pub fn from_vec_vec(v: &Vec<Vec<V>>) -> Self {
-        Self::from_sized_iters(v.iter().map(|vs| vs.iter()))
+    pub fn from_vec_vec_detailed(v: &Vec<Vec<V>>, allocator: A, conf: Conf) -> Self {
+        Self::from_sized_iters_detailed(v.iter().map(|vs| vs.iter()), allocator, conf)
     }
     /// where sizing information is available, faster than from_iters
-    pub fn from_sized_iters<
+    pub fn from_sized_iters_detailed<
         I: ExactSizeIterator<Item = BI> + Clone,
         BI: ExactSizeIterator<Item = &'a V>,
     >(
         i: I,
+        allocator: A,
+        conf: Conf,
     ) -> Self
     where
         V: Clone,
     {
         let content_len_total = i.clone().fold(0, |a, b| a + b.len());
-        let conf = DefaultConf();
         let actual_content_len = content_len_total + i.len() * conf.initial_default_gaps();
         let total_capacity = max(
             conf.initial_capacity(),
             (actual_content_len as f64 * conf.initial_extra_total_proportion()) as usize,
         );
-        let allocator = Global::default();
-        let mem:NonNull<V> = allocator.allocate(Self::layout(total_capacity)).unwrap().cast();
+        let mem: NonNull<V> = allocator
+            .allocate(Self::layout(total_capacity))
+            .unwrap()
+            .cast();
         let mut start = 0;
         let sections = i
             .map(|ss| {
@@ -290,9 +393,33 @@ impl<'a, V: 'a + Clone> VecWithGaps<V, Global, DefaultConf> {
             total: content_len_total,
             allocator,
             mem: mem,
-            conf: conf,
+            conf,
             total_capacity,
         }
+    }
+}
+
+impl<'a, V: 'a + Clone> VecWithGaps<V, Global, DefaultConf> {
+    pub fn from_slice_slice(i: &[&[V]]) -> Self {
+        Self::from_slice_slice_detailed(i, Global::default(), DefaultConf())
+    }
+    pub fn from_iters<I: Iterator<Item = BI>, BI: Iterator<Item = &'a V>>(i: I) -> Self {
+        Self::from_iters_detailed(i, Global::default(), DefaultConf())
+    }
+    pub fn from_vec_vec(v: &Vec<Vec<V>>) -> Self {
+        Self::from_vec_vec_detailed(v, Global::default(), DefaultConf())
+    }
+    /// where sizing information is available, faster than from_iters
+    pub fn from_sized_iters<
+        I: ExactSizeIterator<Item = BI> + Clone,
+        BI: ExactSizeIterator<Item = &'a V>,
+    >(
+        i: I,
+    ) -> Self
+    where
+        V: Clone,
+    {
+        Self::from_sized_iters_detailed(i, Global::default(), DefaultConf())
     }
 }
 
@@ -355,23 +482,14 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
             0
         }
     }
-    fn compute_next_total_capacity_encompassing(&self, encompassing: usize) -> usize {
-        let mut ret = max(self.conf.initial_capacity(), self.total_capacity);
-        while ret <= encompassing {
-            let (nret, overflowed) = ret.overflowing_mul(2);
-            if overflowed {
-                panic!("tried to grow to a size that overflowed usize");
-            }
-            ret = nret;
-        }
-        ret
-    }
     fn increase_capacity_to_fit(&mut self, increasing_to: usize) {
         if increasing_to < self.total_capacity {
             return;
         }
         // find the nearest next power growth
-        let new_total_capacity = self.compute_next_total_capacity_encompassing(increasing_to);
+        let new_total_capacity = self
+            .conf
+            .compute_next_total_capacity_encompassing(increasing_to);
         let new_layout = Self::layout(new_total_capacity);
         self.mem = unsafe {
             self.allocator.grow(
@@ -422,13 +540,13 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
         self.total
     }
 
-    pub fn section_iter<'a>(&'a self) -> VWGSectionIter<'a, V> {
-        VWGSectionIter {
-            sections_start: self.sections.as_ptr(),
-            sections_end: self.sections.as_ptr().wrapping_add(self.sections.len()),
-            mem: self.mem.as_ptr(),
-            _phanto: Default::default(),
-        }
+    pub fn section_slice(&self, section: usize) -> &[V] {
+        let sl = self.sections.len();
+        let s = match self.sections.get(section) {
+            Some(a) => a,
+            None => section_not_found_panic(sl, section),
+        };
+        unsafe { slice::from_raw_parts(self.mem.as_ptr().add(s.start), s.length) }
     }
 
     pub fn iter_lego_ugly_hybrid<'a>(&'a self) -> impl Iterator<Item = &'a V> {
@@ -456,12 +574,13 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
         } = *self;
         let end_of_defined_volume = sections.last().map(|s| s.start + s.length).unwrap(); //we know from ↑↑ that there is at least one section
         let free_space_at_end = total_capacity - end_of_defined_volume;
-        let new_section_capacity = max(section_length * 2, conf.min_nonzero_section_capacity());
+        let new_section_capacity =
+            conf.compute_next_section_capacity_encompassing(section_length + 1);
         let section_capacity_increase = new_section_capacity - section_length;
 
         if free_space_at_end < section_capacity_increase {
             //attempt to grow
-            let new_total_capacity = self.compute_next_total_capacity_encompassing(
+            let new_total_capacity = self.conf.compute_next_total_capacity_encompassing(
                 total_capacity + section_capacity_increase,
             );
             //attempt to just enlarge. If it can't be enlarged, allocate a new section of memory, copy the front as well as the back, and use more efficient nonoverlapping copying functions
@@ -532,10 +651,18 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
         };
         self.push_into_section(si, v)
     }
-    pub fn insert_into_section(&mut self, section: usize, at: usize, v: V) {
+    fn insert_into_section_detailed<F>(
+        &mut self,
+        section: usize,
+        v: V,
+        specified_insert: Result<usize, F>,
+    ) where
+        F: FnMut(&V, &V) -> Ordering,
+    {
         let Self {
             ref sections,
             ref mut total_capacity,
+            mem,
             ..
         } = *self;
         let sn = sections.len();
@@ -547,9 +674,27 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
             section_not_found_panic(sn, section);
         });
         let next_section_start_if_next_section_exists: Option<usize> = si.next().map(|s| s.start);
-        if at > section_length {
-            section_bounds_panic(section_length, at);
-        }
+
+        let at = match specified_insert {
+            Ok(at) => {
+                if at > section_length {
+                    section_bounds_panic(section_length, at);
+                }
+                at
+            }
+            Err(mut comparator) => {
+                let s = unsafe {
+                    slice::from_raw_parts_mut(mem.as_ptr().add(section_start), section_length)
+                };
+                match s.binary_search_by(|b| comparator(&v, b)) {
+                    Ok(_) => {
+                        return;
+                    }
+                    Err(i) => i,
+                }
+            }
+        };
+
         //if there's more content, see if it needs to be moved along and move if so
         let bound = next_section_start_if_next_section_exists.unwrap_or_else(|| *total_capacity);
         // if match next_section_start { Some(next_start)=> section_end == next_start, None=>false } {
@@ -577,12 +722,24 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
         self.sections[section].length += 1;
         self.total += 1;
     }
+    // if we're going to have batch_sorted_merge_insert we might as well have this?
+    pub fn insert_into_sorted_section(
+        &mut self,
+        section: usize,
+        v: V,
+        comparator: impl FnMut(&V, &V) -> Ordering,
+    ) {
+        self.insert_into_section_detailed(section, v, Err(comparator));
+    }
+    pub fn insert_into_section(&mut self, section: usize, at: usize, v: V) {
+        //needs to be given a type parameter, otherwise it "can't infer" F and freaks out
+        self.insert_into_section_detailed::<fn(&V, &V) -> Ordering>(section, v, Ok(at));
+    }
     pub fn take_from_section(&mut self, section: usize, at: usize) -> V {
-        let sl = self.sections.len();
-        let se = self
-            .sections
-            .get_mut(section)
-            .unwrap_or_else(|| section_not_found_panic(sl, section));
+        let se = match self.sections.get_mut(section) {
+            Some(a) => a,
+            None => section_not_found_panic(self.sections.len(), section),
+        };
         if se.length == 0 {
             panic!("index out of bounds: tried to remove item at index {}, but the section contains no elements", at);
         }
@@ -630,13 +787,30 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
         }
         self.sections.remove(section);
     }
-    pub fn iter<'a>(&'a self) -> impl Iterator<Item = &'a V> {
+    pub fn section_iter<'a>(&'a self) -> impl Iterator<Item = &'a [V]> {
         let Self {
             ref sections, mem, ..
         } = *self;
-        sections.iter().flat_map(move |s| {
-            unsafe { slice::from_raw_parts(mem.as_ptr().add(s.start), s.length) }.iter()
-        })
+        sections
+            .iter()
+            .map(move |s| unsafe { slice::from_raw_parts(mem.as_ptr().add(s.start), s.length) })
+    }
+    pub fn iter<'a>(&'a self) -> impl Iterator<Item = &'a V> {
+        self.section_iter().flat_map(|s| s.iter())
+    }
+
+    pub fn section_iter_mut<'a>(&'a mut self) -> impl Iterator<Item = &'a mut [V]> {
+        let Self {
+            ref mut sections,
+            mem,
+            ..
+        } = *self;
+        sections
+            .iter_mut()
+            .map(move |s| unsafe { slice::from_raw_parts_mut(mem.as_ptr().add(s.start), s.length) })
+    }
+    pub fn iter_mut<'a>(&'a mut self) -> impl Iterator<Item = &'a mut V> {
+        self.section_iter_mut().flat_map(|s| s.iter_mut())
     }
     pub fn ugly_ptr_iter<'a>(&'a self) -> VWGIter<'a, V> {
         let secp = self.sections.as_ptr();
@@ -665,15 +839,223 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
             }
         }
     }
-    pub fn iter_mut<'a>(&'a mut self) -> impl Iterator<Item = &'a mut V> {
+
+    /// to be safe, requires that the inputs are sorted, and that each section is sorted. A usize is likely to overflow if they aren't, and I can't rule out access to uninitialized memory. (if you need to batch insert unsorted, please write the *drastically simpler* version optimized for unsorted workloads, and submit a pull request)
+    /// It's also not supposed to insert duplicate elements (in that case, overwrite is called). The non-duplication invariants can also be broken if `src_insertions` contains duplicate elements, but I'm fairly sure that wouldn't cause safety violations.
+    /// if you're wondering why this is so strangely abstracted (and why I went to the extreme efforts of writing a batched insertion function at all), it was needed for CSR++
+    /// in `src_insertions`, the first element of the tuple is the index of the section, second is the things to be inserted into that section
+    pub unsafe fn batch_sorted_merge_insert_detailed<'a, B>(
+        &mut self,
+        src_insertions: impl Iterator<Item = (usize, &'a [B])>,
+        comparator: impl Fn(&B, &V) -> Ordering + Clone,
+        overwrite: impl Fn(&B, &mut V) + Clone,
+        inserting: impl Fn(&B) -> V,
+    ) where
+        B: Clone + 'a,
+        V: 'a,
+    {
+        //overview:
+        //  for each segment
+        //  goes through seeing which vertices will be inserted or not (and overwriting the values of the collisions), which allows it to figure out which spaces need to be expanded, which it then encodes in prying_commands
+        //  executes those commands on the VecWithGaps in the reverse direction
+
+        //TODO considering stack allocating these when possible, some insertions will be small
+        // insertion format:
+        //   read backwards
+        //     section: number
+        //     number_of_elements: number
+        //     each element:
+        //       dst_index: number
+        //       element: value
+
         let Self {
             ref mut sections,
-            mem,
+            ref mut total_capacity,
+            ref mut total,
+            ref mut mem,
+            ref conf,
+            ref allocator,
+        } = *self;
+        let mut prying_commands: Vec<Pry> = Vec::with_capacity(16);
+        let mut insertion_commands: Vec<Insert<'a, B>> = Vec::with_capacity(32);
+        let mut pry_running_total = 0; //represents the amount that the memory has been pried bigger at any given point
+        let mut max_volume_needed = 0; //first tracks the max extents needed by the growing sections, then may be overwritten by the max extent created by pries if that is greater, representing the total volume that will be needed
+
+        //split again by origin vertex
+        // let mut per_vertexi = src_insertion.map(|s| s.split_by(|a,b| a.from.index == b.from.index)).peekable();
+        for (sectioni, for_vertex) in src_insertions {
+            let VWGSection { start, length } = sections[sectioni];
+            let section_slice =
+                unsafe { slice::from_raw_parts_mut(mem.as_ptr().add(start), length) };
+            let mut number_of_additions = 0;
+            //insertion
+            insertions_for_merge(
+                for_vertex,
+                section_slice,
+                comparator.clone(),
+                overwrite.clone(),
+                |inserting_value, dst_index| {
+                    insertion_commands.push(Insert { element: InsertElement{ inserting_value, dst_index } });
+                    number_of_additions += 1;
+                },
+            );
+            insertion_commands.push(Insert { header: InsertHeader {
+                number_of_elements: number_of_additions,
+                into_section: sectioni
+            }});
+            *total += number_of_additions;
+            let required_length = length + number_of_additions;
+            max_volume_needed = pry_running_total + start + required_length; //has to register this because the only way max_volume_needed can exceed the figure computed below is if the length of the final section expands, and if it did, that would be captured here
+                                                                             //decide whether to pry
+            if let Some(ns) = sections.get(sectioni + 1) {
+                let section_capacity_end = ns.start;
+                if start + required_length >= section_capacity_end {
+                    let new_section_capacity =
+                        conf.compute_next_section_capacity_encompassing(required_length);
+                    let pry_distance = (start + new_section_capacity) - section_capacity_end;
+                    let tpd = pry_running_total + pry_distance;
+                    prying_commands.push(Pry {
+                        section_start: sectioni + 1,
+                        pry_by: tpd,
+                    });
+                    pry_running_total = tpd;
+                }
+            }
+        }
+        let whole_volume_end = if let Some(VWGSection { start, length }) = sections.last() {
+            max_volume_needed = max(max_volume_needed, start + pry_running_total + length);
+            start + length
+        } else {
+            0
+        };
+
+        //TODO when grow_in_place makes it into the Allocator API, activate some of this branching
+        if max_volume_needed > *total_capacity {
+            let new_capacity = conf.compute_next_total_capacity_encompassing(max_volume_needed);
+            let newmem = unsafe {
+                allocator
+                    .grow(
+                        mem.cast(),
+                        Self::layout(*total_capacity),
+                        Self::layout(new_capacity),
+                    )
+                    .unwrap()
+                    .cast()
+            };
+            *total_capacity = new_capacity;
+            *mem = newmem;
+            unsafe {
+                self.execute_pries(
+                    ptr::copy,
+                    inserting,
+                    newmem.as_ptr(),
+                    newmem.as_ptr(),
+                    whole_volume_end,
+                    &insertion_commands,
+                    &prying_commands,
+                );
+            }
+            // if unsuccessful grow_in_place, allocate new memory, and use copy_nonoverlapping, this will be faster :
+            // execute_pries(ptr::copy_nonoverlapping, inserting, mem.as_ptr(), newmem, &insertion_commands, &prying_commands);
+        } else {
+            let mc = mem.as_ptr();
+            unsafe {
+                self.execute_pries(
+                    ptr::copy,
+                    inserting,
+                    mc,
+                    mc,
+                    whole_volume_end,
+                    &insertion_commands,
+                    &prying_commands,
+                );
+            }
+        }
+    }
+
+    unsafe fn execute_pries<'a, B>(
+        &mut self,
+        copy_fn: unsafe fn(*const V, *mut V, usize),
+        inserting: impl Fn(&B) -> V,
+        src: *const V,
+        dst: *mut V,
+        end_of_whole_volume: usize,
+        insertion_commands: &Vec<Insert<'a, B>>,
+        pry_commands: &Vec<Pry>,
+    ) {
+        // it would probably be possible to do the pries and insertions in one sweep, but more complicated, maybe try it later
+        // now execute the prying commands
+        let Self {
+            ref mut sections,
+            total_capacity,
             ..
         } = *self;
-        sections.iter_mut().flat_map(move |s| {
-            unsafe { slice::from_raw_parts_mut(mem.as_ptr().add(s.start), s.length) }.iter_mut()
-        })
+        let mut prev_sections_start = sections.len() - 1;
+        let mut prev_element_start = end_of_whole_volume;
+        for Pry {
+            section_start,
+            pry_by,
+        } in pry_commands.iter().rev()
+        {
+            let pry_element_start = sections[*section_start].start;
+            // let pse = sections[section_end];
+            // let pry_element_end = pse.start + pse.length;
+            if pry_element_start + pry_by + (prev_element_start - pry_element_start)
+                > total_capacity
+            {
+                panic!("can't allocate there");
+            }
+            copy_fn(
+                src.add(pry_element_start),
+                dst.add(pry_element_start + pry_by),
+                prev_element_start - pry_element_start,
+            );
+            for s in sections[*section_start..prev_sections_start].iter_mut() {
+                s.start += pry_by;
+            }
+            prev_sections_start = *section_start;
+            prev_element_start = pry_element_start; //TODO: I think this will result in copying slightly more than it needs to, the end of a section is usually a bit before the start of the following section, it will be copying junk
+        }
+
+        let mut inserts = insertion_commands.iter().rev();
+        while let Some(Insert { header: InsertHeader{
+            into_section,
+            number_of_elements,
+        }}) = inserts.next()
+        {
+            let VWGSection {
+                start,
+                ref mut length,
+            } = sections[*into_section];
+            let mut prev_insertion_end = *length;
+            for i in 0..*number_of_elements {
+                let Insert { element: InsertElement{ dst_index, inserting_value } } = inserts.next().unwrap();
+                let pry = number_of_elements - i;
+                copy_fn(
+                    src.add(start + dst_index),
+                    dst.add(start + dst_index + pry),
+                    prev_insertion_end - dst_index,
+                );
+                write(dst.add(start + dst_index + pry - 1), inserting(inserting_value));
+                prev_insertion_end = *dst_index;
+            }
+            *length += number_of_elements;
+        }
+    }
+
+    /// see `batch_sorted_merge_insert_detailed` for full documentation
+    pub unsafe fn batch_sorted_merge_insert<'a>(
+        &mut self,
+        src_insertions: impl Iterator<Item = (usize, &'a [V])>,
+    ) where
+        V: Ord + Clone + 'a,
+    {
+        self.batch_sorted_merge_insert_detailed(
+            src_insertions,
+            |b, v| b.cmp(v),
+            |b, v| *v = b.clone(),
+            |b| b.clone(),
+        );
     }
 }
 impl<V, A: Allocator, C: VecWithGapsConfig> Drop for VecWithGaps<V, A, C> {
@@ -821,4 +1203,119 @@ mod tests {
         }
         assert_eq!(Rc::strong_count(&o), 1);
     }
+
+    #[test]
+    fn test_batch_insert_sorted() {
+        let ss: &[&[usize]] = &[&[1, 2, 3, 4], &[5, 6, 7, 8, 9, 10], &[11, 12, 13]];
+        let mut v = VecWithGaps::from_slice_slice(ss);
+        let insert: &[(usize, &[usize])] = &[(0, &[5])];
+        unsafe{ v.batch_sorted_merge_insert(insert.iter().cloned()); }
+        assert_equal(
+            v.iter(),
+            [1, 2, 3, 4, 5, 5, 6, 7, 8, 9, 10, 11, 12, 13].iter(),
+        );
+    }
+
+    #[test]
+    fn test_batch_insert_sorted_multi() {
+        let ss: &[&[usize]] = &[&[1, 2, 3, 4], &[5, 6, 7, 8, 9, 10], &[11, 12, 13]];
+        let mut v = VecWithGaps::from_slice_slice(ss);
+        let insert: &[(usize, &[usize])] = &[(0, &[5]), (1, &[2]), (2, &[1, 12, 19])];
+        unsafe{ v.batch_sorted_merge_insert(insert.iter().cloned()); }
+        let rs = &[1, 2, 3, 4, 5, 2, 5, 6, 7, 8, 9, 10, 1, 11, 12, 13, 19];
+        assert_equal(v.iter(), rs.iter());
+        assert_eq!(rs.len(), v.total());
+    }
+
+    #[test]
+    fn test_batch_insert_sorted_big_insert() {
+        let ss: &[&[usize]] = &[&[1, 2, 3, 4], &[5, 6, 7, 8, 9, 10], &[11, 12, 13]];
+        let mut v = VecWithGaps::from_slice_slice(ss);
+
+        let amount_to_add: usize = 237;
+        let rv: Vec<usize> = std::iter::repeat(9).take(amount_to_add).collect();
+        unsafe{ v.batch_sorted_merge_insert([(0, rv.as_slice())].iter().cloned()); }
+        let ought: usize = amount_to_add + ss.iter().map(|i| i.len()).sum(): usize;
+        assert_eq!(ought, v.total());
+    }
+    
+    
+    //testing the batch insertion comparison benchmark
+    fn fast_rng(seed: u64) -> impl Rng + Clone {
+        rand::rngs::StdRng::seed_from_u64(seed)
+    }
+    use crate::tests::rand::prelude::SliceRandom;
+    fn create_vwg(size: usize) -> VecWithGaps<usize> {
+        // (this benchmark is trying to model users actively maintaining small sets of things, some users are active and some are less active)
+        let mut rng = fast_rng(1);
+
+        let mut active_sections: Vec<usize> = Vec::new();
+        let mut less_active_sections: Vec<usize> = Vec::new();
+        let mut ret = Vec::<Vec<usize>>::new();
+        let mut total = 0;
+        loop {
+            let eventr: f64 = rng.gen();
+            if eventr < 0.02 {
+                //create a new section
+                let si = ret.len();
+                ret.push(Vec::new());
+                // start it out with something in it
+
+                if rng.gen::<f64>() < 0.8 {
+                    less_active_sections.push(si);
+                } else {
+                    active_sections.push(si);
+                }
+            } else if eventr < 0.93 {
+                //add to an active one
+                if active_sections.len() != 0 {
+                    ret[*active_sections.choose(&mut rng).unwrap()].push(rng.gen_range(0..size));
+                    total += 1;
+                }
+            } else {
+                //add to an old section
+                if less_active_sections.len() != 0 {
+                    ret[*less_active_sections.choose(&mut rng).unwrap()]
+                        .push(rng.gen_range(0..size));
+                    total += 1;
+                }
+            }
+            if total >= size {
+                return VecWithGaps::from_vec_vec(&ret);
+            }
+        }
+    }
+    
+    fn binary_insert_if_not_present<V:Ord>(vs: &mut Vec<V>, p: V) {
+        match vs.binary_search(&p) {
+            Ok(_) => {}
+            Err(i) => {
+                vs.insert(i, p);
+            }
+        }
+    }
+    
+    #[test]
+    fn batch_insertion_benchmark() {
+        let vwg_size = 200 * 13;
+        let n_inserting = 50;
+        let vwg = create_vwg(vwg_size);
+        let addition_size = vwg_size + 90; //biases additions slightly towards the end, to reflect an increasing ID space
+        let mut rng = fast_rng(60);
+
+        let mut v = vwg.clone();
+        let vl = v.len();
+        let mut inserts: Vec<Vec<usize>> = (0..vl).map(|_| Vec::new()).collect();
+        for _ in 0..n_inserting {
+            binary_insert_if_not_present(&mut inserts[rng.gen_range(0..vl)], rng.gen_range(0..addition_size));
+        }
+        unsafe{ v.batch_sorted_merge_insert(inserts.iter().enumerate().filter(|(_,v)| !v.is_empty()).map(|(e, i)| (e, i.as_slice()))); }
+    }
 }
+
+// /// A version of VecWithGaps that has "quick delete" for sections, which, instead of removing a section from the vec, marks it invalid by setting its length to -1. This can also speed up inserts if they're happening at a similar rate as deletes (and aren't happening at the opposite end of the sections vec)
+// struct VVQuickDelete<V> {
+//     core: VecWithGaps<V>,
+//     deletions: [usize;10], //remembers the last 10 deletions (sorted) so that section inserts wont have to copy over as many elements.
+//     real_count: usize,
+// }
