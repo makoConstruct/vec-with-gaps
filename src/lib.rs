@@ -106,7 +106,6 @@ impl<'a, V: 'a> ExactSizeIterator for VWGSectionIter<'a, V> {
 }
 
 // the following three things are used by batched sorted inserts
-const MERGE_SPARSENESS_LIMIT: usize = 20; // TODO, benchmark to figure out what this should be
 /// assumes that the inputs are sorted. Doesn't actually enact the insertions, reports them to the callbacks
 fn insertions_for_merge<'b, B: 'b, V>(
     source: &'b [B],
@@ -114,9 +113,10 @@ fn insertions_for_merge<'b, B: 'b, V>(
     comparator: impl Fn(&B, &V) -> Ordering,
     mut on_collision: impl FnMut(&'b B, &mut V) -> (),
     mut on_insertion: impl FnMut(&'b B, usize) -> (),
+    conf: &impl VecWithGapsConfig,
 ) {
     //iterating is faster than binary-searching if the sizing ratios of the arrays are similar, so check for that
-    if source.len() * MERGE_SPARSENESS_LIMIT < dest_slice.len() {
+    if source.len() * conf.merge_sparseness_limit() < dest_slice.len() {
         for sv in source.iter() {
             let sr = dest_slice.binary_search_by(|c| comparator(sv, c).reverse());
             match sr {
@@ -157,16 +157,25 @@ struct Pry {
     pry_by: usize,
 }
 #[derive(Copy, Clone)]
-struct InsertHeader{
-    into_section:usize,
-    number_of_elements:usize,
+struct InsertHeader {
+    into_section: usize,
+    number_of_elements: usize,
 }
 
-//TODO: an insert instruction that just says "the dst is empty, copy this slice in"
-//TODO: consider trying not storing any insert instructions, and instead going through and doing all of insert calculations again
+//TODO: an insert instruction that just says "the dst is empty, memcpy this slice in"
+//DOTO: consider trying not storing any insert instructions, and instead going through and doing all of insert calculations again
 // wait did we really need to do the insert computations in advance? If we just assumed there weren't going to be any sets, that they were indeed all inserts, it would be much much faster and simpler, mixing sets and inserts....... is insane
-struct InsertElement<'a, B>{ dst_index:usize, inserting_value: &'a B, }
-impl<'a, B> Clone for InsertElement<'a, B>{ fn clone(&self)-> Self { Self{ dst_index: self.dst_index, inserting_value: self.inserting_value } } }
+//for posterity, we did indeed need to do the insert computations eventually *in full*, so it made sense to do them in advance and save whatever memory might have been saved, saving the instructions, *because you need to save the instructions anyway* even if you're just doing the insertions one at a time (in order to do them backwards, for exactly the same reason you have to do the pries backwards)
+
+struct InsertElement<'a, B> {
+    dst_index: usize,
+    inserting_value: &'a B,
+}
+impl<'a, B> Clone for InsertElement<'a, B> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
 impl<'a, B> Copy for InsertElement<'a, B> {}
 
 union Insert<'a, B> {
@@ -181,6 +190,7 @@ pub struct VWGSection {
 }
 /// A data structure that behaves like a vec of vecs, but where the subvecs are kept, in order, in one contiguous section of memory, which improves cache performance for some workloads. Automates the logic of expansion so that each section essentially behaves like a `Vec`.
 /// (The members are pub because rust's restrictions on private members are so strict that I do not believe that private members should be used, and because if you're using this, you know how it works and you care enough about performance to want to be able to mess with it.)
+//TODO: `HeaderVec` with `sections` as the vec. It's not obvious to me that this would save any cache misses, as HeaderVec moves `mem` behind a pointer to a place that may be far enough from the `section` pointer that this actually constitutes adding a third dereference to what would have otherwise only required two dereferences (sections and mem, the rest of the non-HeaderVec VecWithGaps is already on the stack)
 pub struct VecWithGaps<V, A: Allocator = Global, Conf: VecWithGapsConfig = DefaultConf> {
     pub sections: Vec<VWGSection>,
     pub total_capacity: usize,
@@ -195,6 +205,8 @@ pub trait VecWithGapsConfig: Clone {
     fn initial_capacity(&self) -> usize;
     /// when loading from iterators, the gap that's inserted between sections
     fn initial_default_gaps(&self) -> usize;
+    /// the ratio of inserted elements to incumbent elements that must be present to justify using a binary search instead of a linear interleaving when merging two sorted lists
+    fn merge_sparseness_limit(&self) -> usize;
     /// the proportion by which the total backing vec increases when it is outgrown
     fn increase_total_proportion(&self) -> f64;
     /// when being initialized from sized iterators, the extra capacity allocated after actual content is this times the length of the actual content
@@ -230,13 +242,16 @@ pub trait VecWithGapsConfig: Clone {
 }
 impl VecWithGapsConfig for DefaultConf {
     fn section_growth_multiple(&self) -> f64 {
-        2f64
+        1.5f64
+    }
+    fn merge_sparseness_limit(&self) -> usize {
+        36
     }
     fn initial_extra_total_proportion(&self) -> f64 {
         1.3f64
     }
     fn initial_default_gaps(&self) -> usize {
-        2
+        8
     }
     fn initial_capacity(&self) -> usize {
         4
@@ -350,12 +365,12 @@ impl<'a, V: 'a + Clone, A: Allocator + Clone, Conf: VecWithGapsConfig> VecWithGa
         ret
     }
     pub fn from_vec_vec_detailed(v: &Vec<Vec<V>>, allocator: A, conf: Conf) -> Self {
-        Self::from_sized_iters_detailed(v.iter().map(|vs| vs.iter()), allocator, conf)
+        Self::from_sized_iters_detailed(v.iter().map(|vs| vs.iter().cloned()), allocator, conf)
     }
     /// where sizing information is available, faster than from_iters
     pub fn from_sized_iters_detailed<
         I: ExactSizeIterator<Item = BI> + Clone,
-        BI: ExactSizeIterator<Item = &'a V>,
+        BI: ExactSizeIterator<Item = V>,
     >(
         i: I,
         allocator: A,
@@ -381,7 +396,7 @@ impl<'a, V: 'a + Clone, A: Allocator + Clone, Conf: VecWithGapsConfig> VecWithGa
                 let ret = VWGSection { start, length };
                 let mut si = start;
                 for sv in ss {
-                    unsafe { ptr::write(mem.as_ptr().add(si), sv.clone()) };
+                    unsafe { ptr::write(mem.as_ptr().add(si), sv) };
                     si += 1;
                 }
                 start += length + conf.initial_default_gaps();
@@ -412,7 +427,7 @@ impl<'a, V: 'a + Clone> VecWithGaps<V, Global, DefaultConf> {
     /// where sizing information is available, faster than from_iters
     pub fn from_sized_iters<
         I: ExactSizeIterator<Item = BI> + Clone,
-        BI: ExactSizeIterator<Item = &'a V>,
+        BI: ExactSizeIterator<Item = V>,
     >(
         i: I,
     ) -> Self
@@ -651,12 +666,13 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
         };
         self.push_into_section(si, v)
     }
+    /// true iff insertion happened
     fn insert_into_section_detailed<F>(
         &mut self,
         section: usize,
         v: V,
         specified_insert: Result<usize, F>,
-    ) where
+    )-> bool where
         F: FnMut(&V, &V) -> Ordering,
     {
         let Self {
@@ -688,7 +704,7 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
                 };
                 match s.binary_search_by(|b| comparator(&v, b)) {
                     Ok(_) => {
-                        return;
+                        return false;
                     }
                     Err(i) => i,
                 }
@@ -721,15 +737,17 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
         }
         self.sections[section].length += 1;
         self.total += 1;
+        true
     }
     // if we're going to have batch_sorted_merge_insert we might as well have this?
+    /// true iff insertion happened
     pub fn insert_into_sorted_section(
         &mut self,
         section: usize,
         v: V,
         comparator: impl FnMut(&V, &V) -> Ordering,
-    ) {
-        self.insert_into_section_detailed(section, v, Err(comparator));
+    )-> bool {
+        self.insert_into_section_detailed(section, v, Err(comparator))
     }
     pub fn insert_into_section(&mut self, section: usize, at: usize, v: V) {
         //needs to be given a type parameter, otherwise it "can't infer" F and freaks out
@@ -859,7 +877,6 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
         //  goes through seeing which vertices will be inserted or not (and overwriting the values of the collisions), which allows it to figure out which spaces need to be expanded, which it then encodes in prying_commands
         //  executes those commands on the VecWithGaps in the reverse direction
 
-        //TODO considering stack allocating these when possible, some insertions will be small
         // insertion format:
         //   read backwards
         //     section: number
@@ -882,11 +899,9 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
         let mut max_volume_needed = 0; //first tracks the max extents needed by the growing sections, then may be overwritten by the max extent created by pries if that is greater, representing the total volume that will be needed
 
         //split again by origin vertex
-        // let mut per_vertexi = src_insertion.map(|s| s.split_by(|a,b| a.from.index == b.from.index)).peekable();
         for (sectioni, for_vertex) in src_insertions {
             let VWGSection { start, length } = sections[sectioni];
-            let section_slice =
-                unsafe { slice::from_raw_parts_mut(mem.as_ptr().add(start), length) };
+            let section_slice = { slice::from_raw_parts_mut(mem.as_ptr().add(start), length) };
             let mut number_of_additions = 0;
             //insertion
             insertions_for_merge(
@@ -895,17 +910,25 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
                 comparator.clone(),
                 overwrite.clone(),
                 |inserting_value, dst_index| {
-                    insertion_commands.push(Insert { element: InsertElement{ inserting_value, dst_index } });
+                    insertion_commands.push(Insert {
+                        element: InsertElement {
+                            inserting_value,
+                            dst_index,
+                        },
+                    });
                     number_of_additions += 1;
                 },
+                conf,
             );
-            insertion_commands.push(Insert { header: InsertHeader {
-                number_of_elements: number_of_additions,
-                into_section: sectioni
-            }});
+            insertion_commands.push(Insert {
+                header: InsertHeader {
+                    number_of_elements: number_of_additions,
+                    into_section: sectioni,
+                },
+            });
             *total += number_of_additions;
             let required_length = length + number_of_additions;
-            max_volume_needed = pry_running_total + start + required_length; //has to register this because the only way max_volume_needed can exceed the figure computed below is if the length of the final section expands, and if it did, that would be captured here
+            max_volume_needed = pry_running_total + start + required_length; //has to register this because the only way max_volume_needed can exceed the figure computed below is if the length of the final section expands, and if it did, that would be captured here (and if it didn't, that wouldn't be captured here)
                                                                              //decide whether to pry
             if let Some(ns) = sections.get(sectioni + 1) {
                 let section_capacity_end = ns.start;
@@ -932,7 +955,7 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
         //TODO when grow_in_place makes it into the Allocator API, activate some of this branching
         if max_volume_needed > *total_capacity {
             let new_capacity = conf.compute_next_total_capacity_encompassing(max_volume_needed);
-            let newmem = unsafe {
+            let newmem = {
                 allocator
                     .grow(
                         mem.cast(),
@@ -944,7 +967,7 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
             };
             *total_capacity = new_capacity;
             *mem = newmem;
-            unsafe {
+            {
                 self.execute_pries(
                     ptr::copy,
                     inserting,
@@ -959,7 +982,7 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
             // execute_pries(ptr::copy_nonoverlapping, inserting, mem.as_ptr(), newmem, &insertion_commands, &prying_commands);
         } else {
             let mc = mem.as_ptr();
-            unsafe {
+            {
                 self.execute_pries(
                     ptr::copy,
                     inserting,
@@ -1005,23 +1028,27 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
             {
                 panic!("can't allocate there");
             }
+            let volume_end = prev_element_start;
             copy_fn(
                 src.add(pry_element_start),
                 dst.add(pry_element_start + pry_by),
-                prev_element_start - pry_element_start,
+                volume_end - pry_element_start, // DOTO: This copies slightly more than it needs to, the end of a section is usually a bit before the start of the following section, but this is not noticeably slower than computing the end
             );
             for s in sections[*section_start..prev_sections_start].iter_mut() {
                 s.start += pry_by;
             }
             prev_sections_start = *section_start;
-            prev_element_start = pry_element_start; //TODO: I think this will result in copying slightly more than it needs to, the end of a section is usually a bit before the start of the following section, it will be copying junk
+            prev_element_start = pry_element_start;
         }
 
         let mut inserts = insertion_commands.iter().rev();
-        while let Some(Insert { header: InsertHeader{
-            into_section,
-            number_of_elements,
-        }}) = inserts.next()
+        while let Some(Insert {
+            header:
+                InsertHeader {
+                    into_section,
+                    number_of_elements,
+                },
+        }) = inserts.next()
         {
             let VWGSection {
                 start,
@@ -1029,14 +1056,23 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
             } = sections[*into_section];
             let mut prev_insertion_end = *length;
             for i in 0..*number_of_elements {
-                let Insert { element: InsertElement{ dst_index, inserting_value } } = inserts.next().unwrap();
+                let Insert {
+                    element:
+                        InsertElement {
+                            dst_index,
+                            inserting_value,
+                        },
+                } = inserts.next().unwrap();
                 let pry = number_of_elements - i;
                 copy_fn(
                     src.add(start + dst_index),
                     dst.add(start + dst_index + pry),
                     prev_insertion_end - dst_index,
                 );
-                write(dst.add(start + dst_index + pry - 1), inserting(inserting_value));
+                write(
+                    dst.add(start + dst_index + pry - 1),
+                    inserting(inserting_value),
+                );
                 prev_insertion_end = *dst_index;
             }
             *length += number_of_elements;
@@ -1209,7 +1245,9 @@ mod tests {
         let ss: &[&[usize]] = &[&[1, 2, 3, 4], &[5, 6, 7, 8, 9, 10], &[11, 12, 13]];
         let mut v = VecWithGaps::from_slice_slice(ss);
         let insert: &[(usize, &[usize])] = &[(0, &[5])];
-        unsafe{ v.batch_sorted_merge_insert(insert.iter().cloned()); }
+        unsafe {
+            v.batch_sorted_merge_insert(insert.iter().cloned());
+        }
         assert_equal(
             v.iter(),
             [1, 2, 3, 4, 5, 5, 6, 7, 8, 9, 10, 11, 12, 13].iter(),
@@ -1221,7 +1259,9 @@ mod tests {
         let ss: &[&[usize]] = &[&[1, 2, 3, 4], &[5, 6, 7, 8, 9, 10], &[11, 12, 13]];
         let mut v = VecWithGaps::from_slice_slice(ss);
         let insert: &[(usize, &[usize])] = &[(0, &[5]), (1, &[2]), (2, &[1, 12, 19])];
-        unsafe{ v.batch_sorted_merge_insert(insert.iter().cloned()); }
+        unsafe {
+            v.batch_sorted_merge_insert(insert.iter().cloned());
+        }
         let rs = &[1, 2, 3, 4, 5, 2, 5, 6, 7, 8, 9, 10, 1, 11, 12, 13, 19];
         assert_equal(v.iter(), rs.iter());
         assert_eq!(rs.len(), v.total());
@@ -1234,12 +1274,13 @@ mod tests {
 
         let amount_to_add: usize = 237;
         let rv: Vec<usize> = std::iter::repeat(9).take(amount_to_add).collect();
-        unsafe{ v.batch_sorted_merge_insert([(0, rv.as_slice())].iter().cloned()); }
+        unsafe {
+            v.batch_sorted_merge_insert([(0, rv.as_slice())].iter().cloned());
+        }
         let ought: usize = amount_to_add + ss.iter().map(|i| i.len()).sum(): usize;
         assert_eq!(ought, v.total());
     }
-    
-    
+
     //testing the batch insertion comparison benchmark
     fn fast_rng(seed: u64) -> impl Rng + Clone {
         rand::rngs::StdRng::seed_from_u64(seed)
@@ -1285,8 +1326,8 @@ mod tests {
             }
         }
     }
-    
-    fn binary_insert_if_not_present<V:Ord>(vs: &mut Vec<V>, p: V) {
+
+    fn binary_insert_if_not_present<V: Ord>(vs: &mut Vec<V>, p: V) {
         match vs.binary_search(&p) {
             Ok(_) => {}
             Err(i) => {
@@ -1294,7 +1335,7 @@ mod tests {
             }
         }
     }
-    
+
     #[test]
     fn batch_insertion_benchmark() {
         let vwg_size = 200 * 13;
@@ -1307,9 +1348,38 @@ mod tests {
         let vl = v.len();
         let mut inserts: Vec<Vec<usize>> = (0..vl).map(|_| Vec::new()).collect();
         for _ in 0..n_inserting {
-            binary_insert_if_not_present(&mut inserts[rng.gen_range(0..vl)], rng.gen_range(0..addition_size));
+            binary_insert_if_not_present(
+                &mut inserts[rng.gen_range(0..vl)],
+                rng.gen_range(0..addition_size),
+            );
         }
-        unsafe{ v.batch_sorted_merge_insert(inserts.iter().enumerate().filter(|(_,v)| !v.is_empty()).map(|(e, i)| (e, i.as_slice()))); }
+        unsafe {
+            v.batch_sorted_merge_insert(
+                inserts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, v)| !v.is_empty())
+                    .map(|(e, i)| (e, i.as_slice())),
+            );
+        }
+    }
+    
+    #[test]
+    fn insertions_for_merge_test(){
+      let inserting:&[usize] = &[2, 4, 8, 12];
+      let receiving:&mut [usize] = &mut [1, 2, 3, 5, 6, 7, 8, 10, 14];
+      let mut collisions = Vec::new();
+      let mut insertions = Vec::new();
+      insertions_for_merge(
+        inserting,
+        receiving,
+        |a,b| a.cmp(b),
+        |si, _rm| collisions.push(si),
+        |_si, ri| insertions.push(ri),
+        &DefaultConf()
+      );
+      itertools::assert_equal(collisions.iter(), [&2usize,&8usize].iter());
+      itertools::assert_equal(insertions.iter(), [3usize,8usize].iter());
     }
 }
 

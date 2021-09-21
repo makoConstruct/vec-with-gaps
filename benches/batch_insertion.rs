@@ -61,22 +61,21 @@ fn single_insertion(b: &mut Bencher, vwg_size: usize, n_inserting: usize) {
         let vl = v.len();
         let mut inserts: Vec<Vec<usize>> = (0..vl).map(|_| Vec::new()).collect();
         for _ in 0..n_inserting {
-            binary_insert_if_not_present(&mut inserts[rng.gen_range(0..vl)], rng.gen_range(0..addition_size));
+            binary_insert_if_not_present(
+                &mut inserts[rng.gen_range(0..vl)],
+                rng.gen_range(0..addition_size),
+            );
         }
         for (i, vs) in inserts.iter().enumerate() {
             for vsv in vs.iter() {
-                v.insert_into_sorted_section(
-                    i,
-                    *vsv,
-                    |a, b| a.cmp(b),
-                );
+                v.insert_into_sorted_section(i, *vsv, |a, b| a.cmp(b));
             }
         }
         v
     });
 }
 
-fn binary_insert_if_not_present<V:Ord>(vs: &mut Vec<V>, p: V) {
+fn binary_insert_if_not_present<V: Ord>(vs: &mut Vec<V>, p: V) {
     match vs.binary_search(&p) {
         Ok(_) => {}
         Err(i) => {
@@ -95,78 +94,85 @@ fn batch_insertion(b: &mut Bencher, vwg_size: usize, n_inserting: usize) {
         let vl = v.len();
         let mut inserts: Vec<Vec<usize>> = (0..vl).map(|_| Vec::new()).collect();
         for _ in 0..n_inserting {
-            binary_insert_if_not_present(&mut inserts[rng.gen_range(0..vl)], rng.gen_range(0..addition_size));
+            binary_insert_if_not_present(
+                &mut inserts[rng.gen_range(0..vl)],
+                rng.gen_range(0..addition_size),
+            );
         }
-        unsafe{ v.batch_sorted_merge_insert(inserts.iter().enumerate().filter(|(_,v)| !v.is_empty()).map(|(e, i)| (e, i.as_slice()))); }
+        unsafe {
+            v.batch_sorted_merge_insert(
+                inserts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, v)| !v.is_empty())
+                    .map(|(e, i)| (e, i.as_slice())),
+            );
+        }
         v
     });
 }
 
-
-
+const NUMBER_OF_USERS:usize = 200;
+const EDGES_PER_USER:usize = 13;
+const DATA_TOTAL:usize = NUMBER_OF_USERS*EDGES_PER_USER;
 #[bench]
 fn bench_batch_insertion_one(b: &mut Bencher) {
-    batch_insertion(b, 200 * 13, 1);
+    batch_insertion(b, DATA_TOTAL, 1);
 }
 
 #[bench]
 fn bench_single_insertion_one(b: &mut Bencher) {
-    single_insertion(b, 200 * 13, 1);
+    single_insertion(b, DATA_TOTAL, 1);
 }
-
-
 
 #[bench]
 fn bench_batch_insertion_10(b: &mut Bencher) {
-    batch_insertion(b, 200 * 13, 10);
+    batch_insertion(b, DATA_TOTAL, 10);
 }
 
 #[bench]
 fn bench_single_insertion_10(b: &mut Bencher) {
-    single_insertion(b, 200 * 13, 10);
+    single_insertion(b, DATA_TOTAL, 10);
 }
 
 #[bench]
 fn bench_batch_insertion_50(b: &mut Bencher) {
-    batch_insertion(b, 200 * 13, 50);
+    batch_insertion(b, DATA_TOTAL, 50);
 }
 
 #[bench]
 fn bench_single_insertion_50(b: &mut Bencher) {
-    single_insertion(b, 200 * 13, 50);
+    single_insertion(b, DATA_TOTAL, 50);
 }
-
 
 #[bench]
 fn bench_batch_insertion_100(b: &mut Bencher) {
-    batch_insertion(b, 200 * 13, 100);
+    batch_insertion(b, DATA_TOTAL, 100);
 }
 
 #[bench]
 fn bench_single_insertion_100(b: &mut Bencher) {
-    single_insertion(b, 200 * 13, 100);
+    single_insertion(b, DATA_TOTAL, 100);
 }
 
 #[bench]
 fn bench_batch_insertion_200(b: &mut Bencher) {
-    batch_insertion(b, 200 * 13, 200);
+    batch_insertion(b, DATA_TOTAL, 200);
 }
 
 #[bench]
 fn bench_single_insertion_200(b: &mut Bencher) {
-    single_insertion(b, 200 * 13, 200);
+    single_insertion(b, DATA_TOTAL, 200);
 }
-
-
 
 #[bench]
 fn bench_batch_insertion_1000(b: &mut Bencher) {
-    batch_insertion(b, 200 * 13, 1000);
+    batch_insertion(b, DATA_TOTAL, 1000);
 }
 
 #[bench]
 fn bench_single_insertion_1000(b: &mut Bencher) {
-    single_insertion(b, 200 * 13, 1000);
+    single_insertion(b, DATA_TOTAL, 1000);
 }
 
 //finding, batch insertion doesn't start to be faster until about 60 elements
