@@ -112,9 +112,9 @@ fn batch_insertion(b: &mut Bencher, vwg_size: usize, n_inserting: usize) {
     });
 }
 
-const NUMBER_OF_USERS:usize = 200;
-const EDGES_PER_USER:usize = 13;
-const DATA_TOTAL:usize = NUMBER_OF_USERS*EDGES_PER_USER;
+const NUMBER_OF_USERS: usize = 200;
+const EDGES_PER_USER: usize = 13;
+const DATA_TOTAL: usize = NUMBER_OF_USERS * EDGES_PER_USER;
 #[bench]
 fn bench_batch_insertion_one(b: &mut Bencher) {
     batch_insertion(b, DATA_TOTAL, 1);

@@ -11,99 +11,12 @@ use std::{
         Ordering::{Equal, Greater, Less},
     },
     iter::{ExactSizeIterator, FromIterator, Iterator},
-    marker::PhantomData,
     mem::{align_of, size_of},
     ptr,
     ptr::{write, NonNull},
     slice,
     vec::Vec,
 };
-
-pub struct VWGIter<'a, V> {
-    sections_start: *const VWGSection,
-    sections_end: *const VWGSection,
-    within_section_start: *const V,
-    within_section_end: *const V,
-    mem: *const V,
-    _phanto: PhantomData<&'a V>,
-}
-impl<'a, V: 'a> Iterator for VWGIter<'a, V> {
-    type Item = &'a V;
-    fn next(&mut self) -> Option<&'a V> {
-        let Self {
-            mem,
-            ref mut sections_start,
-            sections_end,
-            ref mut within_section_start,
-            ref mut within_section_end,
-            ..
-        } = *self;
-        unsafe {
-            loop {
-                if within_section_start != within_section_end {
-                    let ret = Some(&**within_section_start);
-                    *within_section_start = within_section_start.wrapping_add(1);
-                    return ret;
-                } else {
-                    loop {
-                        if *sections_start != sections_end {
-                            let VWGSection {
-                                start: ss,
-                                length: sl,
-                            } = **sections_start;
-                            *within_section_start = mem.add(ss);
-                            *within_section_end = mem.wrapping_add(ss + sl);
-                            *sections_start = sections_start.wrapping_add(1);
-                            if *within_section_start != *within_section_end {
-                                break;
-                            }
-                        } else {
-                            return None;
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-pub struct VWGSectionIter<'a, V> {
-    sections_start: *const VWGSection,
-    sections_end: *const VWGSection,
-    mem: *const V,
-    _phanto: PhantomData<&'a V>,
-}
-impl<'a, V: 'a> Iterator for VWGSectionIter<'a, V> {
-    type Item = &'a [V];
-    fn next(&mut self) -> Option<Self::Item> {
-        let Self {
-            mem,
-            ref mut sections_start,
-            sections_end,
-            ..
-        } = *self;
-        if *sections_start != sections_end {
-            unsafe {
-                loop {
-                    let VWGSection { start, length } = **sections_start;
-                    let ret = Some(slice::from_raw_parts(mem.add(start), length));
-                    *sections_start = sections_start.add(1);
-                    return ret;
-                }
-            }
-        } else {
-            return None;
-        }
-    }
-}
-impl<'a, V: 'a> ExactSizeIterator for VWGSectionIter<'a, V> {
-    fn len(&self) -> usize {
-        unsafe { self.sections_end.offset_from(self.sections_start) as usize }
-    }
-    fn is_empty(&self) -> bool {
-        self.sections_end == self.sections_start
-    }
-}
 
 // the following three things are used by batched sorted inserts
 /// assumes that the inputs are sorted. Doesn't actually enact the insertions, reports them to the callbacks
@@ -186,12 +99,17 @@ union Insert<'a, B> {
 #[derive(Copy, Clone)]
 pub struct VWGSection {
     pub start: usize,
-    pub length: usize,
+    pub length: isize,
+}
+impl VWGSection {
+    pub fn deleted(&self) -> bool {
+        self.length < 0
+    }
 }
 /// A data structure that behaves like a vec of vecs, but where the subvecs are kept, in order, in one contiguous section of memory, which improves cache performance for some workloads. Automates the logic of expansion so that each section essentially behaves like a `Vec`.
 /// (The members are pub because rust's restrictions on private members are so strict that I do not believe that private members should be used, and because if you're using this, you know how it works and you care enough about performance to want to be able to mess with it.)
 //TODO: `HeaderVec` with `sections` as the vec. It's not obvious to me that this would save any cache misses, as HeaderVec moves `mem` behind a pointer to a place that may be far enough from the `section` pointer that this actually constitutes adding a third dereference to what would have otherwise only required two dereferences (sections and mem, the rest of the non-HeaderVec VecWithGaps is already on the stack)
-pub struct VecWithGaps<V, A: Allocator = Global, Conf: VecWithGapsConfig = DefaultConf> {
+pub struct VecWithGaps<V, A: Allocator = Global, Conf: VecWithGapsConfig = ()> {
     pub sections: Vec<VWGSection>,
     pub total_capacity: usize,
     pub mem: NonNull<V>,
@@ -199,22 +117,34 @@ pub struct VecWithGaps<V, A: Allocator = Global, Conf: VecWithGapsConfig = Defau
     pub allocator: A,
     pub conf: Conf,
 }
-#[derive(Clone, Default)]
-pub struct DefaultConf();
 pub trait VecWithGapsConfig: Clone {
-    fn initial_capacity(&self) -> usize;
+    fn initial_capacity(&self) -> usize {
+        4
+    }
     /// when loading from iterators, the gap that's inserted between sections
-    fn initial_default_gaps(&self) -> usize;
+    fn initial_default_gaps(&self) -> usize {
+        8
+    }
     /// the ratio of inserted elements to incumbent elements that must be present to justify using a binary search instead of a linear interleaving when merging two sorted lists
-    fn merge_sparseness_limit(&self) -> usize;
+    fn merge_sparseness_limit(&self) -> usize {
+        36
+    }
     /// the proportion by which the total backing vec increases when it is outgrown
-    fn increase_total_proportion(&self) -> f64;
+    fn increase_total_proportion(&self) -> f64 {
+        1.4
+    }
     /// when being initialized from sized iterators, the extra capacity allocated after actual content is this times the length of the actual content
-    fn initial_extra_total_proportion(&self) -> f64;
+    fn initial_extra_total_proportion(&self) -> f64 {
+        1.3f64
+    }
     /// the proportion by which a section increases its capacity when outgrown
-    fn section_growth_multiple(&self) -> f64;
+    fn section_growth_multiple(&self) -> f64 {
+        1.5f64
+    }
     /// after a section has begun to outgrow its bounds, the smallest capacity that will be cleared for it
-    fn min_nonzero_section_capacity(&self) -> usize;
+    fn min_nonzero_section_capacity(&self) -> usize {
+        8
+    }
     // /// the maximum number of segments it will try to nudge before just extending the whole
     // fn max_nudge_size()-> usize;
     fn compute_next_total_capacity_encompassing(&self, encompassing: usize) -> usize {
@@ -240,29 +170,7 @@ pub trait VecWithGapsConfig: Clone {
         ret
     }
 }
-impl VecWithGapsConfig for DefaultConf {
-    fn section_growth_multiple(&self) -> f64 {
-        1.5f64
-    }
-    fn merge_sparseness_limit(&self) -> usize {
-        36
-    }
-    fn initial_extra_total_proportion(&self) -> f64 {
-        1.3f64
-    }
-    fn initial_default_gaps(&self) -> usize {
-        8
-    }
-    fn initial_capacity(&self) -> usize {
-        4
-    }
-    fn min_nonzero_section_capacity(&self) -> usize {
-        8
-    }
-    fn increase_total_proportion(&self) -> f64 {
-        1.4
-    }
-}
+impl VecWithGapsConfig for () {}
 
 impl<'a, V: Clone, A: Allocator + Clone + Default, Conf: VecWithGapsConfig + Default>
     FromIterator<&'a [V]> for VecWithGaps<V, A, Conf>
@@ -281,7 +189,7 @@ impl<'a, V: Clone, A: Allocator + Clone + Default, Conf: VecWithGapsConfig + Def
 
 impl<V, A: Allocator + Clone, Conf: VecWithGapsConfig> Clone for VecWithGaps<V, A, Conf> {
     fn clone(&self) -> Self {
-        let new_mem = if let Some(bs) = self.sections.last() {
+        let new_mem = if let Some(bs) = self.last_undeleted_section() {
             let nm = self
                 .allocator
                 .allocate(Self::layout(self.total_capacity))
@@ -291,7 +199,7 @@ impl<V, A: Allocator + Clone, Conf: VecWithGapsConfig> Clone for VecWithGaps<V, 
                 ptr::copy_nonoverlapping(
                     self.mem.as_ptr(),
                     nm.cast().as_ptr(),
-                    bs.start + bs.length,
+                    bs.start + bs.length as usize, //permitted because, note `last_undeleted_section` above
                 );
             }
             nm
@@ -313,9 +221,9 @@ impl<V, A: Allocator + Clone, Conf: VecWithGapsConfig> Clone for VecWithGaps<V, 
     }
 }
 
-impl<V> VecWithGaps<V, Global, DefaultConf> {
+impl<V> VecWithGaps<V, Global, ()> {
     pub fn empty() -> Self {
-        Self::empty_detailed(Global::default(), DefaultConf())
+        Self::empty_detailed(Global::default(), ())
     }
 }
 
@@ -393,7 +301,10 @@ impl<'a, V: 'a + Clone, A: Allocator + Clone, Conf: VecWithGapsConfig> VecWithGa
         let sections = i
             .map(|ss| {
                 let length = ss.len();
-                let ret = VWGSection { start, length };
+                let ret = VWGSection {
+                    start,
+                    length: length as isize,
+                };
                 let mut si = start;
                 for sv in ss {
                     unsafe { ptr::write(mem.as_ptr().add(si), sv) };
@@ -414,15 +325,15 @@ impl<'a, V: 'a + Clone, A: Allocator + Clone, Conf: VecWithGapsConfig> VecWithGa
     }
 }
 
-impl<'a, V: 'a + Clone> VecWithGaps<V, Global, DefaultConf> {
+impl<'a, V: 'a + Clone> VecWithGaps<V, Global, ()> {
     pub fn from_slice_slice(i: &[&[V]]) -> Self {
-        Self::from_slice_slice_detailed(i, Global::default(), DefaultConf())
+        Self::from_slice_slice_detailed(i, Global::default(), ())
     }
     pub fn from_iters<I: Iterator<Item = BI>, BI: Iterator<Item = &'a V>>(i: I) -> Self {
-        Self::from_iters_detailed(i, Global::default(), DefaultConf())
+        Self::from_iters_detailed(i, Global::default(), ())
     }
     pub fn from_vec_vec(v: &Vec<Vec<V>>) -> Self {
-        Self::from_vec_vec_detailed(v, Global::default(), DefaultConf())
+        Self::from_vec_vec_detailed(v, Global::default(), ())
     }
     /// where sizing information is available, faster than from_iters
     pub fn from_sized_iters<
@@ -434,7 +345,7 @@ impl<'a, V: 'a + Clone> VecWithGaps<V, Global, DefaultConf> {
     where
         V: Clone,
     {
-        Self::from_sized_iters_detailed(i, Global::default(), DefaultConf())
+        Self::from_sized_iters_detailed(i, Global::default(), ())
     }
 }
 
@@ -450,13 +361,19 @@ fn section_bounds_panic(item_count: usize, at: usize) -> ! {
         item_count, at
     );
 }
+fn section_deleted_panic(section: usize) -> ! {
+    panic!(
+        "can't get section {}, this section has been flagged for deletion",
+        section
+    );
+}
 
 impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
     /// returns the index of the new section
     pub fn push_section_after_gap(&mut self, gap_width: usize) -> usize {
         let next_section_index = self.sections.len();
-        let start = if let Some(ref bs) = self.sections.last() {
-            bs.start + bs.length + gap_width
+        let start = if let Some(ref bs) = self.last_undeleted_section() {
+            bs.start + bs.length as usize + gap_width
         } else {
             0
         };
@@ -474,25 +391,25 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
             mem,
             ..
         } = *self;
-        let mut sepi = sections.iter_mut();
+        let mut sepi = sections.iter_mut().filter(|s| !s.deleted());
         if let Some(prev_sec) = sepi.next() {
-            let mut last_end = prev_sec.start + prev_sec.length;
+            let mut last_end = prev_sec.start + prev_sec.length as usize;
             for cur_sec in sepi {
                 unsafe {
                     ptr::copy(
                         mem.as_ptr().add(cur_sec.start),
                         mem.as_ptr().add(last_end),
-                        cur_sec.length,
+                        cur_sec.length as usize,
                     );
                 }
                 cur_sec.start = last_end;
-                last_end = cur_sec.start + cur_sec.length;
+                last_end = cur_sec.start + cur_sec.length as usize;
             }
         }
     }
     fn end_of_used_volume(&self) -> usize {
-        if let Some(s) = self.sections.last() {
-            s.start + s.length
+        if let Some(s) = self.last_undeleted_section() {
+            s.start + s.length as usize
         } else {
             0
         }
@@ -525,8 +442,9 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
         let Self {
             mem, ref sections, ..
         } = *self;
+
         sections.get(section).and_then(|se| {
-            if at >= se.length {
+            if se.deleted() || at >= se.length as usize {
                 None
             } else {
                 Some(unsafe { &*(mem.as_ptr().add(se.start + at)) })
@@ -540,7 +458,7 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
             ..
         } = *self;
         sections.get_mut(section).and_then(|se| {
-            if at >= se.length {
+            if se.deleted() || at >= se.length as usize {
                 None
             } else {
                 Some(unsafe { &mut *(mem.as_ptr().add(se.start + at)) })
@@ -556,12 +474,15 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
     }
 
     pub fn section_slice(&self, section: usize) -> &[V] {
-        let sl = self.sections.len();
-        let s = match self.sections.get(section) {
-            Some(a) => a,
-            None => section_not_found_panic(sl, section),
-        };
-        unsafe { slice::from_raw_parts(self.mem.as_ptr().add(s.start), s.length) }
+        let s = self.get_undeleted_section(section);
+        unsafe { slice::from_raw_parts(self.mem.as_ptr().add(s.start), s.length as usize) }
+    }
+
+    fn last_undeleted(v: &Vec<VWGSection>) -> Option<&VWGSection> {
+        v.iter().rev().find(|e| !e.deleted())
+    }
+    pub fn last_undeleted_section(&self) -> Option<&VWGSection> {
+        Self::last_undeleted(&self.sections)
     }
 
     pub fn iter_lego_ugly_hybrid<'a>(&'a self) -> impl Iterator<Item = &'a V> {
@@ -587,7 +508,9 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
             ref conf,
             ..
         } = *self;
-        let end_of_defined_volume = sections.last().map(|s| s.start + s.length).unwrap(); //we know from ↑↑ that there is at least one section
+        let end_of_defined_volume = Self::last_undeleted(&sections)
+            .map(|s| s.start + s.length as usize)
+            .unwrap(); //we know from ↑↑ that there is at least one section
         let free_space_at_end = total_capacity - end_of_defined_volume;
         let new_section_capacity =
             conf.compute_next_section_capacity_encompassing(section_length + 1);
@@ -652,16 +575,55 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
             s.start += section_capacity_increase;
         }
     }
+    fn get_undeleted_section_from(v: &Vec<VWGSection>, section: usize) -> &VWGSection {
+        if let Some(se) = v.get(section) {
+            if se.deleted() {
+                section_deleted_panic(section)
+            } else {
+                se
+            }
+        } else {
+            section_not_found_panic(v.len(), section)
+        }
+    }
+    fn get_mut_undeleted_section_from<'a>(
+        v: &'a mut Vec<VWGSection>,
+        section: usize,
+    ) -> &'a mut VWGSection {
+        //this can be made the same as above once you have polonius
+        let vl = v.len();
+        if let Some(se) = v.get_mut(section) {
+            if se.deleted() {
+                section_deleted_panic(section)
+            } else {
+                return se;
+            }
+        } else {
+            section_not_found_panic(vl, section)
+        }
+    }
+    fn get_undeleted_section(&self, section: usize) -> &VWGSection {
+        Self::get_undeleted_section_from(&self.sections, section)
+    }
+    fn get_mut_section(&mut self, section: usize) -> &mut VWGSection {
+        Self::get_mut_undeleted_section_from(&mut self.sections, section)
+    }
     pub fn push_into_section(&mut self, section: usize, v: V) {
-        let at = self.sections[section].length;
-        self.insert_into_section(section, at, v);
+        let sel = self.get_undeleted_section(section).length as usize;
+        self.insert_into_section(section, sel as usize, v);
     }
     /// pushes to the backmost section, creating a section if none exist
     pub fn push(&mut self, v: V) {
-        let si = if self.sections.len() == 0 {
-            self.push_section();
-            0
+        let si = if let Some((ei, _)) = self
+            .sections
+            .iter_mut()
+            .enumerate()
+            .rev()
+            .find(|(_ei, e)| !e.deleted())
+        {
+            ei
         } else {
+            self.push_section();
             self.sections.len() - 1
         };
         self.push_into_section(si, v)
@@ -672,7 +634,8 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
         section: usize,
         v: V,
         specified_insert: Result<usize, F>,
-    )-> bool where
+    ) -> bool
+    where
         F: FnMut(&V, &V) -> Ordering,
     {
         let Self {
@@ -681,26 +644,27 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
             mem,
             ..
         } = *self;
-        let sn = sections.len();
         let mut si = sections.iter().skip(section);
         let &VWGSection {
             start: section_start,
             length: section_length,
-        } = si.next().unwrap_or_else(|| {
-            section_not_found_panic(sn, section);
-        });
+        } = Self::get_undeleted_section_from(&sections, section);
+        //this is wrong, next section could be deleted
         let next_section_start_if_next_section_exists: Option<usize> = si.next().map(|s| s.start);
 
         let at = match specified_insert {
             Ok(at) => {
-                if at > section_length {
-                    section_bounds_panic(section_length, at);
+                if at > section_length as usize {
+                    section_bounds_panic(section_length as usize, at);
                 }
                 at
             }
             Err(mut comparator) => {
                 let s = unsafe {
-                    slice::from_raw_parts_mut(mem.as_ptr().add(section_start), section_length)
+                    slice::from_raw_parts_mut(
+                        mem.as_ptr().add(section_start),
+                        section_length as usize,
+                    )
                 };
                 match s.binary_search_by(|b| comparator(&v, b)) {
                     Ok(_) => {
@@ -714,21 +678,21 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
         //if there's more content, see if it needs to be moved along and move if so
         let bound = next_section_start_if_next_section_exists.unwrap_or_else(|| *total_capacity);
         // if match next_section_start { Some(next_start)=> section_end == next_start, None=>false } {
-        if bound == section_start + section_length {
+        if bound == section_start + section_length as usize {
             //needs to expand the bound
             self.expand(
                 section,
-                section_length,
+                section_length as usize,
                 next_section_start_if_next_section_exists,
             );
         }
-        if at != section_length {
+        if at != section_length as usize {
             //within section
             unsafe {
                 ptr::copy(
                     self.mem.as_ptr().add(section_start + at),
                     self.mem.as_ptr().add(section_start + at + 1),
-                    section_length - at,
+                    section_length as usize - at,
                 );
             }
         }
@@ -746,41 +710,39 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
         section: usize,
         v: V,
         comparator: impl FnMut(&V, &V) -> Ordering,
-    )-> bool {
+    ) -> bool {
         self.insert_into_section_detailed(section, v, Err(comparator))
     }
     pub fn insert_into_section(&mut self, section: usize, at: usize, v: V) {
         //needs to be given a type parameter, otherwise it "can't infer" F and freaks out
         self.insert_into_section_detailed::<fn(&V, &V) -> Ordering>(section, v, Ok(at));
     }
-    pub fn take_from_section(&mut self, section: usize, at: usize) -> V {
-        let se = match self.sections.get_mut(section) {
-            Some(a) => a,
-            None => section_not_found_panic(self.sections.len(), section),
-        };
+    pub fn remove_from_section(&mut self, section: usize, at: usize) -> V {
+        let mem = self.mem;
+        let se = self.get_mut_section(section);
         if se.length == 0 {
-            panic!("index out of bounds: tried to remove item at index {}, but the section contains no elements", at);
+            section_bounds_panic(se.length as usize, at);
         }
         //doing a frankly excessive thing where sometimes we move the front forward instead of moving the back backwards
-        let ret = unsafe { ptr::read(self.mem.as_ptr().add(se.start + at)) };
-        if section > 0 && at < se.length / 2 {
+        let ret = unsafe { ptr::read(mem.as_ptr().add(se.start + at)) };
+        if section > 0 && at < se.length as usize / 2 {
             if at != 0 {
                 unsafe {
                     ptr::copy(
-                        self.mem.as_ptr().add(se.start),
-                        self.mem.as_ptr().add(se.start + 1),
+                        mem.as_ptr().add(se.start),
+                        mem.as_ptr().add(se.start + 1),
                         at,
                     )
                 };
             }
             se.start += 1;
         } else {
-            if at < se.length - 1 {
+            if at < se.length as usize - 1 {
                 unsafe {
                     ptr::copy(
-                        self.mem.as_ptr().add(se.start + at + 1),
-                        self.mem.as_ptr().add(se.start + at),
-                        se.length - 1 - at,
+                        mem.as_ptr().add(se.start + at + 1),
+                        mem.as_ptr().add(se.start + at),
+                        se.length as usize - 1 - at,
                     )
                 };
             }
@@ -789,8 +751,22 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
         self.total -= 1;
         ret
     }
-    pub fn remove_from_section(&mut self, section: usize, at: usize) {
-        self.take_from_section(section, at);
+    /// removes the section by flagging it as deleted, without moving the sections vec around, potentially saving some (though a small number of) memory moves and keeping IDs stable.
+    pub fn quick_remove_section(&mut self, section: usize) {
+        let Self {
+            mem,
+            ref mut sections,
+            ref mut total,
+            ..
+        } = *self;
+        let se = Self::get_mut_undeleted_section_from(sections, section);
+        for i in 0..se.length as usize {
+            unsafe {
+                ptr::drop_in_place(&mut *mem.as_ptr().add(se.start + i));
+            }
+        }
+        *total -= se.length as usize;
+        se.length = -1;
     }
     pub fn remove_section(&mut self, section: usize) {
         let sl = self.sections.len();
@@ -798,10 +774,13 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
             .sections
             .get_mut(section)
             .unwrap_or_else(|| section_not_found_panic(sl, section));
-        for i in 0..se.length {
-            unsafe {
-                ptr::drop_in_place(&mut *self.mem.as_ptr().add(se.start + i));
+        if !se.deleted() {
+            for i in 0..se.length as usize {
+                unsafe {
+                    ptr::drop_in_place(&mut *self.mem.as_ptr().add(se.start as usize + i));
+                }
             }
+            self.total -= se.length as usize;
         }
         self.sections.remove(section);
     }
@@ -811,7 +790,10 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
         } = *self;
         sections
             .iter()
-            .map(move |s| unsafe { slice::from_raw_parts(mem.as_ptr().add(s.start), s.length) })
+            .filter(|s| !s.deleted())
+            .map(move |s| unsafe {
+                slice::from_raw_parts(mem.as_ptr().add(s.start), s.length as usize)
+            })
     }
     pub fn iter<'a>(&'a self) -> impl Iterator<Item = &'a V> {
         self.section_iter().flat_map(|s| s.iter())
@@ -825,37 +807,13 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
         } = *self;
         sections
             .iter_mut()
-            .map(move |s| unsafe { slice::from_raw_parts_mut(mem.as_ptr().add(s.start), s.length) })
+            .filter(|s| !s.deleted())
+            .map(move |s| unsafe {
+                slice::from_raw_parts_mut(mem.as_ptr().add(s.start), s.length as usize)
+            })
     }
     pub fn iter_mut<'a>(&'a mut self) -> impl Iterator<Item = &'a mut V> {
         self.section_iter_mut().flat_map(|s| s.iter_mut())
-    }
-    pub fn ugly_ptr_iter<'a>(&'a self) -> VWGIter<'a, V> {
-        let secp = self.sections.as_ptr();
-        let sl = self.sections.len();
-        if sl != 0 {
-            let &VWGSection {
-                start: tss,
-                length: tsl,
-            } = unsafe { &*secp };
-            VWGIter {
-                mem: self.mem.as_ptr(),
-                sections_start: secp.wrapping_add(1),
-                sections_end: secp.wrapping_add(sl),
-                within_section_start: self.mem.as_ptr().wrapping_add(tss),
-                within_section_end: self.mem.as_ptr().wrapping_add(tss + tsl),
-                _phanto: Default::default(),
-            }
-        } else {
-            VWGIter {
-                mem: self.mem.as_ptr(),
-                sections_start: ptr::null(),
-                sections_end: ptr::null(),
-                within_section_start: ptr::null(),
-                within_section_end: ptr::null(),
-                _phanto: Default::default(),
-            }
-        }
     }
 
     /// to be safe, requires that the inputs are sorted, and that each section is sorted. A usize is likely to overflow if they aren't, and I can't rule out access to uninitialized memory. (if you need to batch insert unsorted, please write the *drastically simpler* version optimized for unsorted workloads, and submit a pull request)
@@ -901,7 +859,14 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
         //split again by origin vertex
         for (sectioni, for_vertex) in src_insertions {
             let VWGSection { start, length } = sections[sectioni];
-            let section_slice = { slice::from_raw_parts_mut(mem.as_ptr().add(start), length) };
+            if length == -1 {
+                panic!(
+                    "inserting to section {}, but this section has been quick-deleted",
+                    sectioni
+                );
+            }
+            let section_slice =
+                { slice::from_raw_parts_mut(mem.as_ptr().add(start), length as usize) };
             let mut number_of_additions = 0;
             //insertion
             insertions_for_merge(
@@ -927,7 +892,7 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
                 },
             });
             *total += number_of_additions;
-            let required_length = length + number_of_additions;
+            let required_length = length as usize + number_of_additions;
             max_volume_needed = pry_running_total + start + required_length; //has to register this because the only way max_volume_needed can exceed the figure computed below is if the length of the final section expands, and if it did, that would be captured here (and if it didn't, that wouldn't be captured here)
                                                                              //decide whether to pry
             if let Some(ns) = sections.get(sectioni + 1) {
@@ -946,8 +911,11 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
             }
         }
         let whole_volume_end = if let Some(VWGSection { start, length }) = sections.last() {
-            max_volume_needed = max(max_volume_needed, start + pry_running_total + length);
-            start + length
+            max_volume_needed = max(
+                max_volume_needed,
+                start + pry_running_total + *length as usize,
+            );
+            start + *length as usize
         } else {
             0
         };
@@ -1054,7 +1022,7 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
                 start,
                 ref mut length,
             } = sections[*into_section];
-            let mut prev_insertion_end = *length;
+            let mut prev_insertion_end = *length as usize; //caller would have panicked if there were any quick-deleted sections
             for i in 0..*number_of_elements {
                 let Insert {
                     element:
@@ -1075,7 +1043,7 @@ impl<V, A: Allocator, Conf: VecWithGapsConfig> VecWithGaps<V, A, Conf> {
                 );
                 prev_insertion_end = *dst_index;
             }
-            *length += number_of_elements;
+            *length += *number_of_elements as isize;
         }
     }
 
@@ -1104,7 +1072,11 @@ impl<V, A: Allocator, C: VecWithGapsConfig> Drop for VecWithGaps<V, A, C> {
             ..
         } = *self;
         for s in sections {
-            let ss = unsafe { slice::from_raw_parts_mut(mem.as_ptr().add(s.start), s.length) };
+            if s.deleted() {
+                continue;
+            }
+            let ss =
+                unsafe { slice::from_raw_parts_mut(mem.as_ptr().add(s.start), s.length as usize) };
             for vv in ss {
                 unsafe {
                     ptr::drop_in_place(&mut *vv);
@@ -1181,13 +1153,6 @@ mod tests {
         assert_equal(v.iter(), std::iter::repeat(&7).take(pushed));
     }
 
-    #[test]
-    fn construct_from_iters() {
-        let src: Vec<Vec<usize>> = vec![vec![1, 2, 3, 4], vec![5, 6, 7], vec![8, 9, 10]];
-        let v = VecWithGaps::from_iters(src.iter().map(|s| s.iter()));
-        assert_equal(src.iter().flat_map(|s| s.iter()), v.ugly_ptr_iter());
-    }
-
     // fn print<V: std::fmt::Debug>(v: &VecWithGaps<V>) {
     //     println!("-");
     //     for s in v.section_iter() {
@@ -1203,9 +1168,9 @@ mod tests {
         let src: &[&[usize]] = &[&[1, 2, 3, 4], &[5, 6, 7, 8, 9, 10], &[11, 12, 13]];
         //  [1,2,3,4,5,6,7,8,9,10,11,12,13];
         let mut v = VecWithGaps::from_iters(src.iter().map(|s| s.iter()));
-        assert_eq!(6, v.take_from_section(1, 1));
+        assert_eq!(6, v.remove_from_section(1, 1));
         assert_equal(v.iter(), [1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13].iter());
-        assert_eq!(9, v.take_from_section(1, 3));
+        assert_eq!(9, v.remove_from_section(1, 3));
         assert_equal(v.iter(), [1, 2, 3, 4, 5, 7, 8, 10, 11, 12, 13].iter());
         v.remove_section(1);
         assert_equal(v.iter(), [1, 2, 3, 4, 11, 12, 13].iter());
@@ -1363,23 +1328,44 @@ mod tests {
             );
         }
     }
-    
+
     #[test]
-    fn insertions_for_merge_test(){
-      let inserting:&[usize] = &[2, 4, 8, 12];
-      let receiving:&mut [usize] = &mut [1, 2, 3, 5, 6, 7, 8, 10, 14];
-      let mut collisions = Vec::new();
-      let mut insertions = Vec::new();
-      insertions_for_merge(
-        inserting,
-        receiving,
-        |a,b| a.cmp(b),
-        |si, _rm| collisions.push(si),
-        |_si, ri| insertions.push(ri),
-        &DefaultConf()
-      );
-      itertools::assert_equal(collisions.iter(), [&2usize,&8usize].iter());
-      itertools::assert_equal(insertions.iter(), [3usize,8usize].iter());
+    fn insertions_for_merge_test() {
+        let inserting: &[usize] = &[2, 4, 8, 12];
+        let receiving: &mut [usize] = &mut [1, 2, 3, 5, 6, 7, 8, 10, 14];
+        let mut collisions = Vec::new();
+        let mut insertions = Vec::new();
+        insertions_for_merge(
+            inserting,
+            receiving,
+            |a, b| a.cmp(b),
+            |si, _rm| collisions.push(si),
+            |_si, ri| insertions.push(ri),
+            &(),
+        );
+        itertools::assert_equal(collisions.iter(), [&2usize, &8usize].iter());
+        itertools::assert_equal(insertions.iter(), [3usize, 8usize].iter());
+    }
+
+    #[test]
+    fn test_quick_deletions() {
+        let mut subject: VecWithGaps<usize> = VecWithGaps::empty();
+        subject.push(2);
+        subject.push(3);
+        subject.push_section_after_gap(4);
+        subject.push(4);
+        subject.push_section_after_gap(0);
+        subject.push(5);
+        subject.push_section_after_gap(0);
+        subject.push(6);
+        subject.push_section_after_gap(0);
+        subject.push(7);
+        subject.quick_remove_section(2);
+        subject.quick_remove_section(4);
+        subject.push_section_after_gap(0);
+        subject.push(8);
+
+        itertools::assert_equal(subject.iter(), (&[2, 3, 4, 6, 8]).iter());
     }
 }
 
