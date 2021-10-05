@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 #![feature(test)]
-extern crate pcg;
 extern crate rand;
 extern crate test;
 
