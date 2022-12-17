@@ -67,7 +67,7 @@ fn single_insertion(b: &mut Bencher, vwg_size: usize, n_inserting: usize) {
         }
         for (i, vs) in inserts.iter().enumerate() {
             for vsv in vs.iter() {
-                v.insert_into_sorted_section(i, *vsv, |a, b| a.cmp(b));
+                v.insert_into_sorted_section_by(i, *vsv, false, |a, b| a.cmp(b)).unwrap();
             }
         }
         v
@@ -99,13 +99,13 @@ fn batch_insertion(b: &mut Bencher, vwg_size: usize, n_inserting: usize) {
             );
         }
         unsafe {
-            v.batch_sorted_merge_insert(
+            drop(v.batch_sorted_merge_insert(
                 inserts
                     .iter()
                     .enumerate()
                     .filter(|(_, v)| !v.is_empty())
                     .map(|(e, i)| (e, i.as_slice())),
-            );
+            ));
         }
         v
     });

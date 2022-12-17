@@ -63,7 +63,7 @@ impl<V: Debug> VWG<V> for VecWithGaps<V> {
         self.push_section_after_gap(0)
     }
     fn push(&mut self, section: usize, v: V) {
-        self.push_into_section(section, v);
+        drop(self.push_into_section(section, v));
     }
     fn fold<F: Fn(V, &V) -> V>(&self, first: V, f: F) -> V {
         self.iter().fold(first, f)
@@ -152,7 +152,7 @@ fn bench_vwg_ugly_read(b: &mut Bencher, ve: &VecWithGaps<[usize; 2]>) {
         let mut total = 0;
         for _ in 0..READ_REPS {
             let r = ve
-                .ugly_ptr_iter()
+                .iter()
                 .fold([0, 0], |a, b| [a[0] + b[0] + b[1], a[1] + b[1]]);
             total += r[0] * r[1];
         }

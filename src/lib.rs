@@ -1,5 +1,4 @@
 #![feature(
-    generic_associated_types,
     allocator_api,
     exact_size_is_empty,
     type_ascription
@@ -1356,7 +1355,7 @@ mod tests {
             v.batch_sorted_merge_insert([(0, rv.as_slice())].iter().cloned())
                 .unwrap();
         }
-        let ought: usize = amount_to_add + ss.iter().map(|i| i.len()).sum(): usize;
+        let ought: usize = amount_to_add + ss.iter().map(|i| i.len()).sum::<usize>();
         assert_eq!(ought, v.total());
     }
 
